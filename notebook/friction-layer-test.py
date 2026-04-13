@@ -358,11 +358,13 @@ def TI_index(x):
 
 ### run the whole process for all tiles ###
 
-all_tiles = [ #"N00E006", "N00E009", "N00E012", "N00E015",
-             "N03E006", "N03E009", "N03E012", "N03E015",
-             "N06E006", "N06E009", "N06E012", "N06E015",
-             "N09E006", "N09E009", "N09E012", "N09E015",
-             "N12E006", "N12E009", "N12E012", "N12E015"]
+# all_tiles = [ #"N00E006", "N00E009", "N00E012", "N00E015",
+#              "N03E006", "N03E009", "N03E012", "N03E015",
+#              "N06E006", "N06E009", "N06E012", "N06E015",
+#              "N09E006", "N09E009", "N09E012", "N09E015",
+#              "N12E006", "N12E009", "N12E012", "N12E015"]
+
+all_tiles = ["N09E012"]
 
 for selected_tile in all_tiles:
     print(selected_tile, datetime.datetime.now())
