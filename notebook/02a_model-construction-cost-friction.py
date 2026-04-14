@@ -1,7 +1,6 @@
 import geopandas as gpd
 import pandas as pd
 import rioxarray as rio
-import dask.array as da
 import numpy as np
 import xarray as xr
 from rasterio.enums import Resampling
@@ -330,25 +329,20 @@ for selected_tile in all_tiles:
     lc_codes, lc_costs = speed_map_lc
     lc_map = dict(zip(lc_codes.tolist(), lc_costs.tolist()))
 
-    speedsurface_lc = landcover.copy(deep=False)
-    speedsurface_lc.data = da.full(landcover.shape, np.nan, dtype=np.float32,
-                                   chunks=landcover.data.chunks)
-
-    def map_lc_block(block, lc_map):
-        block_out = np.full(block.shape, np.nan, dtype=np.float32)
-        for code, cost in lc_map.items():
-            block_out[block == code] = cost
-        return block_out
-
-    speedsurface_lc.data = da.map_blocks(map_lc_block, landcover.data, lc_map, dtype=np.float32)
-
-    # FIX: scale landcover downscale factor to match the downscaled DEM.
-    #      Landcover is native 10 m; original code used factor 3 to reach ~30 m.
-    #      Now we go 10 m → 30 m × DEM_DOWNSCALE_FACTOR using Resampling.max (categorical).
+    # Downscale the raw categorical landcover FIRST (uint8 = 8x smaller than float32),
+    # then apply cost mapping on the already-small downscaled array.
+    # rioxarray's reproject() forces .values (full numpy load) regardless of dask backing,
+    # so doing the reproject on uint8 before converting to float32 avoids the OOM error.
     lc_downscale_factor = 3 * DEM_DOWNSCALE_FACTOR
-    speedsurface_lc = downscaling(speedsurface_lc, lc_downscale_factor, resampling=Resampling.max)
-    print(f"  Landcover downscaled → {speedsurface_lc.rio.shape}  (factor {lc_downscale_factor})")
+    landcover_ds = downscaling(landcover, lc_downscale_factor, resampling=Resampling.max)
+    print(f"  Landcover downscaled → {landcover_ds.rio.shape}  (factor {lc_downscale_factor})")
 
+    lc_vals = landcover_ds.values  # small numpy array after downscaling
+    out = np.full(lc_vals.shape, np.nan, dtype=np.float32)
+    for code, cost in lc_map.items():
+        out[lc_vals == code] = cost
+
+    speedsurface_lc = landcover_ds.copy(data=out).astype(np.float32)
     speedsurface_lc = baseline_cost * speedsurface_lc
 
     # ---- rasterize roads ----
