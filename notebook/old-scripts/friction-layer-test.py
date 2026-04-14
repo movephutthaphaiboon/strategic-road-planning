@@ -1,6 +1,7 @@
 import geopandas as gpd
 import pandas as pd
 import rioxarray as rio
+import dask.array as da
 import numpy as np
 import xarray as xr
 from rasterio.enums import Resampling
@@ -47,7 +48,13 @@ def slopespeed(slopes, TI):
         return EWV
     
 
-    return xr.apply_ufunc(_model, slopes, TI)
+    return xr.apply_ufunc(
+        _model,
+        slopes,
+        TI,
+        dask='parallelized',
+        output_dtypes=[np.float32]
+    )
 
 
 
@@ -71,7 +78,9 @@ def computeSlopeImpact(dem):
     # take the mean speed for both upwards and downwards slope.
     # relative to going along the flat (0 slope)
 
-    slopes = 0.5 * (slopespeed(slopes) + slopespeed(-slopes)) / slopespeed(0)
+    slopes = 0.5 * (
+        slopespeed(slopes) + slopespeed(-slopes)
+    ) / slopespeed(0)
 
     return slopes
 
@@ -369,7 +378,9 @@ all_tiles = ["N09E012"]
 for selected_tile in all_tiles:
     print(selected_tile, datetime.datetime.now())
     ### read DEM ###
-    dem = rio.open_rasterio(f"../data/input/DEM/COP30/COP30_{selected_tile}.tif", masked=True)[0,:,:]
+    dem = rio.open_rasterio(f"../data/input/DEM/COP30/COP30_{selected_tile}.tif", masked=True, chunks={"x": 512, "y": 512})
+    if len(dem.shape) == 3 and dem.shape[0] == 1:
+        dem = dem.squeeze("band")
 
     ### compute slope ###
     dem_slope = computePercentageSlope(dem = dem)
@@ -378,7 +389,13 @@ for selected_tile in all_tiles:
     dem_slope = xr.where(dem_slope >= 100, np.nan, dem_slope)
 
     ### apply speed function ###
-    dem_TI = xr.apply_ufunc(TI_index, dem_slope, vectorize=True)
+    dem_TI = xr.apply_ufunc(
+        TI_index,
+        dem_slope,
+        vectorize=True,
+        dask='parallelized',
+        output_dtypes=[np.float32]
+    )
 
     dem_cost_slope = slopespeed(dem_slope, dem_TI)
 
@@ -393,17 +410,21 @@ for selected_tile in all_tiles:
     baseline_cost = 0.5 ### 0.5 mUSD/km
 
     ### read speed conversation for OSM and landcover ##
-    speed_map_OSM = readRoadSpeedMap('../data/input/Functions/OSM_road_cost_'+mode+'.csv',road='fclass',speed='cost_km')
+    # speed_map_OSM = readRoadSpeedMap('../data/input/Functions/OSM_road_cost_'+mode+'.csv',road='fclass',speed='cost_km')
+    speed_map_OSM = readRoadSpeedMap('../data/input/Functions/OSM_road_cost_'+mode+'-surface-based.csv',road='fclass',speed='cost_km')
     speed_map_lc = readLandcoverSpeedMap('../data/input/Functions/land_cover_cost_'+mode+'.csv',landcover='Code',speed='cost_km')
 
     ## convert ##
     speed_map_OSM = baseline_cost * speed_map_OSM
 
     ### read Road_network ###
-    roads_all = gpd.read_file('../data/input/Road_network/hotosm_cmr_roads_lines_shp/hotosm_cmr_roads_lines_shp.shp')[['osm_id','highway','geometry']].rename(columns = {'highway':'fclass'})
-
+    # roads_all = gpd.read_file('../data/input/Road_network/hotosm_cmr_roads_lines_shp/hotosm_cmr_roads_lines_shp.shp')[['osm_id','highway','geometry']].rename(columns = {'highway':'fclass'})
+    roads_all = gpd.read_file('../data/output/processed_roads_official/cleaned_merged_osm_heigit_liu-ver3-midterm.gpkg')[['osm_id','highway','geometry', 'liu_surface']].rename(columns = {'liu_surface':'fclass'})
+    
     ### read landcover ###
-    landcover = rio.open_rasterio("../data/input/Landcover/ESA_WorldCover_10m_2021_v200_60deg_macrotile_S30E000/ESA_WorldCover_10m_2021_V200_"+selected_tile+"_Map.tif", masked=True)[0,:,:]
+    landcover = rio.open_rasterio("../data/input/Landcover/ESA_WorldCover_10m_2021_v200_60deg_macrotile_S30E000/ESA_WorldCover_10m_2021_V200_"+selected_tile+"_Map.tif", masked=True, chunks={"x": 512, "y": 512})
+    if len(landcover.shape) == 3 and landcover.shape[0] == 1:
+        landcover = landcover.squeeze("band")
     
     ### clip to DEM ###
     landcover = clip_box(rio_orig = landcover, rio_clip = dem_cost)
@@ -413,20 +434,19 @@ for selected_tile in all_tiles:
     lc_codes, lc_costs = speed_map_lc
     lc_map = dict(zip(lc_codes.tolist(), lc_costs.tolist()))
 
-    speedsurface_lc = xr.full_like(landcover, np.nan, dtype=np.float32)
 
-    chunk_rows = 1024
-    for r0 in range(0, landcover.shape[0], chunk_rows):
-        r1 = min(r0 + chunk_rows, landcover.shape[0])
+    # Use Dask for memory-safe block processing
+    speedsurface_lc = landcover.copy(deep=False)
+    speedsurface_lc.data = da.full(landcover.shape, np.nan, dtype=np.float32, chunks=landcover.data.chunks)
 
-        block = np.asarray(landcover.values[r0:r1, :])
+    # Process in blocks using Dask map_blocks
+    def map_lc_block(block, lc_map):
         block_out = np.full(block.shape, np.nan, dtype=np.float32)
-
         for code, cost in lc_map.items():
             block_out[block == code] = cost
+        return block_out
 
-        speedsurface_lc.values[r0:r1, :] = block_out
-    # BEFORE CHUNKING => MemoryError: Unable to allocate 9.65 GiB for an array with shape (1295784009,) and data type float64
+    speedsurface_lc.data = da.map_blocks(map_lc_block, landcover.data, lc_map, dtype=np.float32)
 
     ### upscale from 10 to 30m ####
     speedsurface_lc = downscaling(rio_orig = speedsurface_lc, downscale_factor = 3)
@@ -455,5 +475,6 @@ for selected_tile in all_tiles:
     costsurface = speed_to_cost(speedsurface * dem_cost_project)
     #costsurface = xr.where(costsurface == 0, np.nan, costsurface)
     costsurface = costsurface.rio.write_crs(4326)
-    costsurface.rio.to_raster("../data/output/construction_cost_friction_"+selected_tile+'.tif')
+    # Compute and write to disk (trigger Dask computation)
+    costsurface.compute().rio.to_raster("../data/output/construction_cost_friction_"+selected_tile+'.tif')
     
