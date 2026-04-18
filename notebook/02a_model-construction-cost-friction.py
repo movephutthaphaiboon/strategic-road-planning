@@ -246,13 +246,13 @@ def TI_index(x):
 #  10 = ~300 m (100x fewer pixels, very fast)
 DEM_DOWNSCALE_FACTOR = 3
 
-# all_tiles = ["N09E012"]
+all_tiles = ["N03E009", "N03E012"]
 
-all_tiles = [ "N00E006", "N00E009", "N00E012", "N00E015",
-             "N03E006", "N03E009", "N03E012", "N03E015",
-             "N06E006", "N06E009", "N06E012", "N06E015",
-             "N09E006", "N09E009", "N09E012", "N09E015",
-             "N12E006", "N12E009", "N12E012", "N12E015"]
+# all_tiles = [ "N00E006", "N00E009", "N00E012", "N00E015",
+#              "N03E006", "N03E009", "N03E012", "N03E015",
+#              "N06E006", "N06E009", "N06E012", "N06E015",
+#              "N09E006", "N09E009", "N09E012", "N09E015",
+#              "N12E006", "N12E009", "N12E012", "N12E015"]
 
 for selected_tile in all_tiles:
     print(f"\n=== {selected_tile}  {datetime.datetime.now()} ===")
@@ -312,9 +312,15 @@ for selected_tile in all_tiles:
     roads_all = roads_all.to_crs(epsg=4326)
     print(f"  Roads reprojected CRS: {roads_all.crs}")
 
-    # Diagnostic: confirm liu_surface values match the CSV fclass column
-    print(f"  liu_surface unique values: {roads_all['fclass'].unique()}")
-    print(f"  speed_map_OSM index: {speed_map_OSM.index.tolist()}")
+    # Filter to roads with a recognised surface label.
+    # Rows where liu_surface is NaN or not in the speed map produce 0 in rasterization,
+    # which becomes NaN and falls through to the expensive landcover cost — wrong.
+    valid_fclass = set(speed_map_OSM.index.tolist())
+    n_before = len(roads_all)
+    roads_all = roads_all[roads_all['fclass'].isin(valid_fclass)].copy()
+    n_after = len(roads_all)
+    print(f"  Roads after fclass filter: {n_after:,} / {n_before:,} "
+          f"(dropped {n_before - n_after:,} rows without paved/unpaved label)")
 
     # ---- landcover ----
     landcover = rio.open_rasterio(
@@ -353,6 +359,18 @@ for selected_tile in all_tiles:
     speedsurface_OSM = rasterizeAllRoads(roads_all, speedsurface_lc, speed_map_OSM_reverse)
     speedsurface_OSM = speedsurface_OSM.rio.write_crs(4326)
 
+    # DIAGNOSTIC: check how many road pixels were actually rasterized
+    _road_vals = speedsurface_OSM.values
+    _n_road_px = int(np.isfinite(_road_vals).sum() - np.isnan(_road_vals).sum())
+    _n_road_px = int((~np.isnan(_road_vals)).sum())
+    print(f"  Road pixels rasterized : {_n_road_px:,}  "
+          f"(out of {_road_vals.size:,} total pixels, "
+          f"{100*_n_road_px/_road_vals.size:.2f}%)")
+    if _n_road_px > 0:
+        _road_only = _road_vals[~np.isnan(_road_vals)]
+        print(f"  speedsurface_OSM range : {_road_only.min():.4f} – {_road_only.max():.4f}  "
+              f"(inverted costs; larger = cheaper road)")
+
     # ---- align DEM cost to road/landcover grid ----
     dem_cost_project = clip_box(rio_orig=dem_cost, rio_clip=speedsurface_OSM)
     dem_cost_project = dem_cost_project.rio.reproject_match(speedsurface_OSM)
@@ -360,15 +378,29 @@ for selected_tile in all_tiles:
     dem_cost_project['y'] = speedsurface_OSM['y']
 
     # ---- combine layers ----
-    # Where roads exist → use road cost (1/inverted = original cost, very cheap for paved).
-    # Elsewhere → use land cover cost.
-    speedsurface = xr.where(speedsurface_OSM.notnull(), 1 / speedsurface_OSM, speedsurface_lc)
+    # Where roads exist → use road cost (terrain-independent: road is already built).
+    # Elsewhere → use land cover cost scaled by slope (terrain matters for new construction).
+    speedsurface_no_road = speedsurface_lc * dem_cost_project
+    speedsurface = xr.where(speedsurface_OSM.notnull(), 1 / speedsurface_OSM, speedsurface_no_road)
 
-    # Multiply by slope factor then convert mUSD/km → USD/pixel
-    costsurface = speed_to_cost(speedsurface * dem_cost_project)
+    # DIAGNOSTIC: check final cost surface at road vs non-road pixels
+    _cost_vals = speed_to_cost(speedsurface).values
+    _road_mask = ~np.isnan(_road_vals)
+    if _road_mask.any():
+        print(f"  costsurface at road px : min={_cost_vals[_road_mask].min():.2f}  "
+              f"max={_cost_vals[_road_mask].max():.2f}  "
+              f"mean={_cost_vals[_road_mask].mean():.2f}")
+    _nonroad_mask = np.isnan(_road_vals) & np.isfinite(_cost_vals)
+    if _nonroad_mask.any():
+        print(f"  costsurface non-road   : min={_cost_vals[_nonroad_mask].min():.2f}  "
+              f"max={_cost_vals[_nonroad_mask].max():.2f}  "
+              f"mean={_cost_vals[_nonroad_mask].mean():.2f}")
+
+    # Convert mUSD/km → USD/pixel
+    costsurface = speed_to_cost(speedsurface)
     costsurface = costsurface.rio.write_crs(4326)
 
-    out_path = f"../data/output/cmr-construction-cost-friction/construction_cost_friction_{selected_tile}_90m.tif"
+    out_path = f"../data/output/cmr-construction-cost-friction-90m/construction_cost_friction_{selected_tile}_90m.tif"
     costsurface.compute().rio.to_raster(out_path)
     print(f"  Saved → {out_path}")
     print(f"  Done: {selected_tile}  {datetime.datetime.now()}")

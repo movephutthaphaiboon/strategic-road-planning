@@ -17,17 +17,14 @@ import os
 import numpy as np
 import geopandas as gpd
 import rasterio
-from rasterio.merge import merge
 from rasterio.mask import mask as rio_mask
-from rasterio.enums import Resampling
-from rasterio.io import MemoryFile
 
 # ---- paths ----
 TILE_DIR   = "../data/output/cmr-construction-cost-friction-90m"
 OUT_VRT    = "../data/output/cmr-construction-cost-friction-90m/cmr_friction_90m.vrt"
 OUT_TIF    = "../data/output/cmr-construction-cost-friction-90m/cmr_friction_90m_merged.tif"
 OUT_CLIPPED = "../data/output/cmr-construction-cost-friction-90m/cmr_friction_90m_clipped.tif"
-BOUNDARY_SHP = "../data/input/cmr_admin_boundaries_humdata/cmr_admin0_em.shp"
+BOUNDARY_SHP = "../data/input/cmr_admin_boundaries_humdata/cmr-buffer.gpkg"
 
 # ---- collect tiles ----
 tile_files = sorted(glob.glob(os.path.join(TILE_DIR, "construction_cost_friction_*.tif")))
@@ -51,23 +48,19 @@ print(f"\nVRT saved → {OUT_VRT}")
 print("  Open this in QGIS for a quick seamless preview (no data duplicated).")
 
 # ============================================================
-# Step 2: Pad tile edges, then merge onto a common pixel grid
+# Step 2: Pad each tile by 1 pixel on south and east edges, then merge
 # ============================================================
-# Each tile is processed independently and downscaled, so adjacent tiles
-# end up with a sub-pixel grid offset at their shared boundary — visible
-# as a thin gap or stripe in QGIS.
-#
-# Fix: extend each tile by N_PAD pixels at its south and east edges by
-# repeating the edge row/column. This gives rasterio.merge overlapping
-# data at every seam so it always has a value to place there.
-#
-# Tile ordering (sorted = south-to-north, west-to-east) combined with
-# method='first' means each tile's real interior data wins at the seam;
-# the padded extension of the neighbouring tile only fills any leftover gap.
+# Adjacent tiles have a 1-pixel gap at shared edges due to sub-pixel grid
+# offsets from independent downscaling. Repeating the last row/column by
+# exactly 1 pixel fills the gap without duplicating data visibly.
 
-N_PAD = 5   # pixels to extend (~450 m at 90 m resolution; well beyond 1-pixel offset)
+from rasterio.merge import merge
+from rasterio.enums import Resampling
+from rasterio.io import MemoryFile
 
-print(f"\nPadding {len(tile_files)} tiles by {N_PAD} pixels at south and east edges...")
+N_PAD = 1
+
+print(f"\nPadding {len(tile_files)} tiles by {N_PAD} pixel on south and east edges ...")
 padded_memfiles = []
 padded_sources  = []
 first_meta      = None
@@ -80,30 +73,22 @@ for tile_file in tile_files:
         if first_meta is None:
             first_meta = meta.copy()
 
-        # The processing script writes 0 as the fill value; convert to NaN
-        # so merge() treats those pixels as transparent.
-        data[data == 0] = np.nan
+        data[data == 0] = np.nan   # fill value → transparent for merge
 
-        # --- south edge padding ---
-        # In raster convention row 0 = north, last row = south.
-        # Repeating the last N rows extends the tile south without inventing values.
-        data = np.concatenate([data, data[:, -N_PAD:, :]], axis=1)
-
-        # --- east edge padding ---
-        data = np.concatenate([data, data[:, :, -N_PAD:]], axis=2)
-
+        data = np.concatenate([data, data[:, -N_PAD:, :]], axis=1)   # south
+        data = np.concatenate([data, data[:, :, -N_PAD:]], axis=2)   # east
         meta.update({"height": data.shape[1], "width": data.shape[2]})
 
         mf = MemoryFile()
         with mf.open(**meta) as m:
             m.write(data)
         padded_memfiles.append(mf)
-        padded_sources.append(mf.open())   # keep open for merge()
+        padded_sources.append(mf.open())
 
 mosaic, transform = merge(
     padded_sources,
     resampling=Resampling.nearest,
-    method="first",   # real interior data (placed first) wins over padded extensions
+    method="first",
     nodata=np.nan,
 )
 
