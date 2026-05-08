@@ -7,11 +7,11 @@ impact metrics for the proposed road network.
 
 Metrics implemented:
   [1] Road classification — km of paved / unpaved / to_be_built
+  [2] Construction cost   — USD for upgrade and new-build segments
+  [3] Deforestation risk  — ha of forest within buffer zones of action roads
 
 Metrics to be added:
-  [ ] Road construction cost
   [ ] Mining capacity
-  [ ] Increased deforestation
   [ ] Increased forest fragmentation
 
 Approach for road classification:
@@ -52,11 +52,14 @@ warnings.filterwarnings("ignore")
 # PATHS
 # =============================================================================
 
-BASE_DIR  = Path(__file__).parent.parent
-ROADS_FP  = BASE_DIR / "data/output/processed_roads_official/cleaned_merged_osm_heigit_liu-ver3-midterm.gpkg"
-FRICTION_FP = BASE_DIR / "data/output/cmr-construction-cost-friction-90m/cmr_friction_90m_clipped.tif"
+BASE_DIR       = Path(__file__).parent.parent
+ROADS_FP       = BASE_DIR / "data/output/processed_roads_official/cleaned_merged_osm_heigit_liu-ver3-midterm.gpkg"
+FRICTION_FP    = BASE_DIR / "data/output/cmr-construction-cost-friction-90m/cmr_friction_90m_clipped.tif"
+TREECOVER_FP   = BASE_DIR / "data/output/processed-hansen-treecover/cameroon_treecover2024_30m.tif"
 
-ROAD_TYPE_COL = "liu_surface"
+ROAD_TYPE_COL      = "liu_surface"
+FOREST_THRESHOLD   = 10    # minimum canopy cover (%) to count as forest (FAO-aligned)
+BUFFER_DISTANCES_M = [0, 100, 250, 500, 750, 1000]
 
 # =============================================================================
 # REFERENCE GRID
@@ -283,6 +286,117 @@ def save_classified_raster(classified: np.ndarray, transform, crs,
     print(f"  Classified raster saved → {out_fp}")
 
 
+def save_classified_lines(paths_gdf: gpd.GeoDataFrame,
+                          classified_raster: np.ndarray,
+                          transform,
+                          crs,
+                          friction: np.ndarray,
+                          out_dir: Path,
+                          scenario_stem: str):
+    """
+    Split mine-to-port paths into line segments by road action class and
+    save as a GeoPackage.
+
+    Points are sampled at sub-pixel intervals along each path geometry,
+    classified by sampling the classified_raster, then grouped into
+    contiguous segments of the same action class (upgrade / build).
+    Paved segments are discarded — only action roads are written.
+
+    Output attributes per segment:
+        mine_id, mine_name, closest_port, action_needed,
+        length_km, construction_cost_usd, scenario
+    """
+    from shapely.geometry import LineString
+
+    geod = Geod(ellps="WGS84")
+    sample_interval_m = 45   # sub-pixel (~half the 90 m pixel size)
+
+    cls_h, cls_w = classified_raster.shape
+    fri_h, fri_w = friction.shape
+
+    paths = paths_gdf[paths_gdf.geometry.notna()].copy()
+    if paths.crs != crs:
+        paths = paths.to_crs(crs)
+
+    records = []
+
+    for _, row in paths.iterrows():
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+
+        mine_id   = row.get("mine_id",      "")
+        mine_name = row.get("mine_name",     "")
+        port      = row.get("closest_port",  "")
+
+        # Dense point sampling along the path geometry
+        path_length_m = abs(geod.geometry_length(geom))
+        n_steps = max(2, int(path_length_m / sample_interval_m))
+        pts = [geom.interpolate(i / n_steps, normalized=True) for i in range(n_steps + 1)]
+
+        # Sample classified raster at each point
+        pt_classes = []
+        pt_coords  = []
+        for pt in pts:
+            r, c = rasterio.transform.rowcol(transform, pt.x, pt.y)
+            cls = int(classified_raster[r, c]) if (0 <= r < cls_h and 0 <= c < cls_w) else 0
+            pt_classes.append(cls)
+            pt_coords.append((pt.x, pt.y))
+
+        # Group consecutive points of the same action class (2=upgrade, 3=build)
+        i = 0
+        while i < len(pt_classes):
+            cls = pt_classes[i]
+            if cls not in (2, 3):
+                i += 1
+                continue
+
+            j = i + 1
+            while j < len(pt_classes) and pt_classes[j] == cls:
+                j += 1
+
+            seg_coords = pt_coords[i:j]
+            if len(seg_coords) < 2:
+                i = j
+                continue
+
+            line = LineString(seg_coords)
+            seg_length_km = abs(geod.geometry_length(line)) / 1000
+
+            # Sum friction over unique pixels — avoids double-counting pixels
+            # that contain multiple sample points
+            seen_px = set()
+            cost = 0.0
+            for x, y in seg_coords:
+                r, c = rasterio.transform.rowcol(transform, x, y)
+                if (r, c) not in seen_px and 0 <= r < fri_h and 0 <= c < fri_w:
+                    seen_px.add((r, c))
+                    v = friction[r, c]
+                    if np.isfinite(v):
+                        cost += float(v)
+
+            records.append({
+                "mine_id":               mine_id,
+                "mine_name":             mine_name,
+                "closest_port":          port,
+                "action_needed":         "upgrade" if cls == 2 else "build",
+                "length_km":             round(seg_length_km, 3),
+                "construction_cost_usd": round(cost, 2),
+                "scenario":              scenario_stem,
+                "geometry":              line,
+            })
+            i = j
+
+    if not records:
+        print("  No upgrade or build segments found.")
+        return
+
+    out_gdf = gpd.GeoDataFrame(records, crs=crs)
+    out_fp = out_dir / f"action_roads_{scenario_stem}.gpkg"
+    out_gdf.to_file(out_fp, driver="GPKG")
+    print(f"  Action roads → {out_fp}  ({len(out_gdf)} segments)")
+
+
 def print_road_classification(result: dict):
     total = result["total_km"]
     def pct(v): return 100 * v / total if total > 0 else 0
@@ -297,19 +411,283 @@ def print_road_classification(result: dict):
 
 
 # =============================================================================
-# FUTURE METRICS (stubs — implement here as the project grows)
+# METRIC 2 — Construction cost
 # =============================================================================
 
-# def metric_construction_cost(path_raster, road_classification, cost_table) -> dict:
-#     """Compute total construction cost from road classification + cost table."""
-#     ...
+def load_friction_values(friction_fp: Path, shape: tuple, transform,
+                         crs) -> np.ndarray:
+    """
+    Read the friction raster (USD/pixel construction cost) resampled to the
+    reference grid.  Returns a float32 array with NaN for nodata pixels.
+    """
+    with rasterio.open(friction_fp) as src:
+        friction = np.full(shape, np.nan, dtype=np.float32)
+        rasterio.warp.reproject(
+            source=rasterio.band(src, 1),
+            destination=friction,
+            dst_transform=transform,
+            dst_crs=crs,
+            resampling=rasterio.enums.Resampling.nearest,
+        )
+    n_valid = int(np.isfinite(friction).sum())
+    print(f"  Friction raster: {n_valid:,} valid pixels loaded")
+    return friction
+
+
+def metric_construction_cost(classified_raster: np.ndarray,
+                              friction: np.ndarray) -> dict:
+    """
+    Sum friction pixel values (USD/pixel) for each road action class.
+
+    - upgrade_cost_usd   : sum over pixels where path follows unpaved road
+                           (needs surfacing / upgrading)
+    - new_build_cost_usd : sum over pixels where no road exists
+                           (needs to be built from scratch)
+    - total_cost_usd     : upgrade + new build
+
+    Paved pixels are excluded — road already meets standard, cost = 0.
+
+    Parameters
+    ----------
+    classified_raster : uint8 array (0=bg, 1=paved, 2=unpaved, 3=to_be_built)
+    friction          : float32 array of construction cost in USD/pixel
+    """
+    upgrade_mask   = classified_raster == 2
+    new_build_mask = classified_raster == 3
+
+    upgrade_cost   = float(np.nansum(friction[upgrade_mask]))
+    new_build_cost = float(np.nansum(friction[new_build_mask]))
+    total_cost     = upgrade_cost + new_build_cost
+
+    return {
+        "upgrade_cost_usd":   round(upgrade_cost,   2),
+        "new_build_cost_usd": round(new_build_cost, 2),
+        "total_cost_usd":     round(total_cost,     2),
+    }
+
+
+def print_construction_cost(result: dict):
+    print(f"\n  Construction cost:")
+    print(f"  {'─'*48}")
+    print(f"  {'Upgrade (unpaved → paved)':<25}: ${result['upgrade_cost_usd']:>15,.0f}")
+    print(f"  {'New build':<25}: ${result['new_build_cost_usd']:>15,.0f}")
+    print(f"  {'─'*48}")
+    print(f"  {'Total':<25}: ${result['total_cost_usd']:>15,.0f}")
+
+# =============================================================================
+# METRIC 3 — Deforestation risk
+# =============================================================================
+
+def metric_deforestation(classified_raster_fp: Path,
+                         save_buffer_rasters: bool = False,
+                         out_dir: Path = None,
+                         scenario_stem: str = None) -> dict:
+    """
+    Estimate the area of forest at risk of deforestation from road actions.
+
+    Reads the classified raster produced by save_classified_raster() and the
+    30 m Hansen tree-cover layer.  For pixels classified as 'unpaved' (upgrade)
+    or 'to_be_built' (new construction), counts how much forest falls within
+    each of several buffer distances from those roads.
+
+    Buffer distances: 0 m (road footprint only), 100, 250, 500, 750, 1000 m.
+
+    No double-counting: rasterize_paths() already calls unary_union() before
+    burning, so shared segments across multiple mines are merged into one
+    geometry.  The distance transform then runs on a binary mask — each pixel
+    is counted once regardless of how many mines use that corridor.
+
+    Strategy
+    --------
+    1. Load the classified raster and the treecover window that covers the
+       action-road bounding box plus 1 km padding.
+    2. Reproject the classified raster to the 30 m treecover pixel grid
+       (nearest-neighbour, preserving class values).
+    3. Compute one Euclidean distance transform per road class (upgrade / build).
+       The combined (action) distance is np.minimum of the two — no third EDT.
+    4. Threshold at each buffer distance → upsample to 30 m → weighted sum → ha.
+
+    Optional raster output (save_buffer_rasters=True)
+    -------------------------------------------------
+    Saves one GeoTIFF per buffer distance to out_dir, named:
+        defor_buffer_{buf_m}m_{scenario_stem}.tif
+    Pixel values match the classified raster convention:
+        0 = not in any action-road buffer
+        2 = within buffer of a road to be upgraded
+        3 = within buffer of a road to be built  (overwrites 2 where both overlap)
+
+    Returns keys (per class × buffer):
+        defor_upgrade_Xm_ha  — forest within X m of roads to be upgraded
+        defor_build_Xm_ha    — forest within X m of roads to be built
+        defor_action_Xm_ha   — combined (upgrade + build)
+    """
+    import math
+    from scipy.ndimage import distance_transform_edt
+    from rasterio.warp import reproject as warp_reproject, Resampling as WarpResampling
+    from rasterio.windows import from_bounds as window_from_bounds
+    from rasterio.transform import Affine
+
+    print(f"  Loading classified raster: {classified_raster_fp.name}")
+    with rasterio.open(classified_raster_fp) as cls_src:
+        cls_arr       = cls_src.read(1)
+        cls_transform = cls_src.transform
+        cls_crs       = cls_src.crs
+
+    action_mask = (cls_arr == 2) | (cls_arr == 3)
+    if not action_mask.any():
+        print("  WARNING: no upgrade or build pixels found — skipping deforestation.")
+        return {}
+
+    # Pixel size of the classified raster (~90 m)
+    lat_cls    = cls_transform.f + (cls_arr.shape[0] / 2) * cls_transform.e
+    cls_px_m_x = abs(cls_transform.a) * 111_320 * math.cos(math.radians(lat_cls))
+    cls_px_m_y = abs(cls_transform.e) * 111_320
+    cls_px_size_m = (cls_px_m_x + cls_px_m_y) / 2
+
+    # ── Crop cls_arr to a tight subregion at 90 m ─────────────────────────────
+    # Pad by enough pixels to cover the largest buffer distance.
+    # This keeps the EDT array small — the full classified raster is only read
+    # once and then immediately cropped, so memory stays bounded.
+    rows, cols = np.where(action_mask)
+    r_min, r_max = int(rows.min()), int(rows.max())
+    c_min, c_max = int(cols.min()), int(cols.max())
+
+    px_pad = math.ceil((BUFFER_DISTANCES_M[-1] + 200) / cls_px_size_m)
+    r0 = max(0, r_min - px_pad);  r1 = min(cls_arr.shape[0], r_max + px_pad + 1)
+    c0 = max(0, c_min - px_pad);  c1 = min(cls_arr.shape[1], c_max + px_pad + 1)
+
+    cls_sub = cls_arr[r0:r1, c0:c1]
+    cls_sub_transform = Affine(
+        cls_transform.a, 0, cls_transform.c + c0 * cls_transform.a,
+        0, cls_transform.e, cls_transform.f + r0 * cls_transform.e,
+    )
+    del cls_arr   # free the full raster — only the subregion is needed from here
+
+    print(f"  Classified subregion: {cls_sub.shape[0]:,} rows × {cls_sub.shape[1]:,} cols "
+          f"(~{cls_sub.shape[0]*cls_px_size_m/1000:.0f} km × "
+          f"{cls_sub.shape[1]*cls_px_size_m/1000:.0f} km at ~{cls_px_size_m:.0f} m)")
+
+    # ── Read 30 m treecover for the same geographic extent ────────────────────
+    # Derive bounds from cls_sub's transform so the windows align.
+    sub_left   = cls_sub_transform.c
+    sub_top    = cls_sub_transform.f
+    sub_right  = sub_left + cls_sub.shape[1] * cls_sub_transform.a
+    sub_bottom = sub_top  + cls_sub.shape[0] * cls_sub_transform.e
+
+    print(f"  Reading treecover window from {TREECOVER_FP.name} ...")
+    with rasterio.open(TREECOVER_FP) as tc_src:
+        tc_crs = tc_src.crs
+
+        if cls_crs != tc_crs:
+            from pyproj import Transformer
+            sub_left, sub_bottom, sub_right, sub_top = Transformer.from_crs(
+                cls_crs, tc_crs, always_xy=True
+            ).transform_bounds(sub_left, sub_bottom, sub_right, sub_top)
+
+        b          = tc_src.bounds
+        sub_left   = max(sub_left,   b.left);   sub_right  = min(sub_right,  b.right)
+        sub_top    = min(sub_top,    b.top);    sub_bottom = max(sub_bottom, b.bottom)
+
+        tc_window    = window_from_bounds(sub_left, sub_bottom, sub_right, sub_top, tc_src.transform)
+        tc_window    = tc_window.round_lengths().round_offsets()
+        tc_arr       = tc_src.read(1, window=tc_window)
+        tc_transform = tc_src.window_transform(tc_window)
+
+    tc_shape = tc_arr.shape
+    print(f"  Treecover window: {tc_shape[0]:,} rows × {tc_shape[1]:,} cols "
+          f"(~{tc_shape[0]*30/1000:.0f} km × {tc_shape[1]*30/1000:.0f} km at 30 m)")
+
+    # Pixel area at 30 m (used for ha counts)
+    lat_tc     = tc_transform.f + (tc_shape[0] / 2) * tc_transform.e
+    px_m_x     = abs(tc_transform.a) * 111_320 * math.cos(math.radians(lat_tc))
+    px_m_y     = abs(tc_transform.e) * 111_320
+    px_area_ha = px_m_x * px_m_y / 10_000
+
+    # Canopy fraction (0.0–1.0) — used to weight each pixel's contribution.
+    # A pixel with 80% cover counts as 0.8 × px_area_ha of forest.
+    canopy_frac = tc_arr.astype(np.float32) / 100.0
+    print(f"  Total canopy-weighted forest area in window: "
+          f"{float(canopy_frac.sum() * px_area_ha):,.0f} ha")
+
+    # ── Distance transforms at 90 m (small array) ─────────────────────────────
+    # Scipy distance_transform_edt allocates float64 internally — running on the
+    # 90 m subregion keeps peak usage ~0.9 GB instead of 7+ GB at 30 m.
+    # .astype(float32) frees the float64 intermediate immediately.
+    _inf_sub = np.full(cls_sub.shape, np.inf, dtype=np.float32)
+
+    mask_upgrade = cls_sub == 2
+    mask_build   = cls_sub == 3
+
+    dist_upgrade_90 = (distance_transform_edt(~mask_upgrade).astype(np.float32) * cls_px_size_m
+                       if mask_upgrade.any() else _inf_sub.copy())
+    dist_build_90   = (distance_transform_edt(~mask_build).astype(np.float32) * cls_px_size_m
+                       if mask_build.any() else _inf_sub)
+
+    # ── Per-buffer: upsample 90 m mask → 30 m, count forest, save raster ──────
+    # Build the combined uint8 mask at 90 m for each buffer distance, upsample
+    # to the 30 m treecover grid (nearest-neighbour), then count.  buf_30m is
+    # reused each iteration to avoid accumulating large arrays.
+    if save_buffer_rasters:
+        if out_dir is None:
+            raise ValueError("out_dir must be provided when save_buffer_rasters=True")
+        stem = scenario_stem or classified_raster_fp.stem
+        buf_profile = {
+            "driver": "GTiff", "dtype": np.uint8, "nodata": 0,
+            "width": tc_shape[1], "height": tc_shape[0], "count": 1,
+            "crs": tc_crs, "transform": tc_transform, "compress": "lzw",
+        }
+        print(f"  Saving buffer rasters to {out_dir} ...")
+
+    results = {}
+    buf_30m = np.zeros(tc_shape, dtype=np.uint8)   # reused each iteration
+
+    for buf_m in BUFFER_DISTANCES_M:
+        # 90 m buffer mask: build takes priority over upgrade where they overlap
+        buf_90m = np.zeros(cls_sub.shape, dtype=np.uint8)
+        buf_90m[(dist_upgrade_90 <= buf_m) & (dist_build_90 > buf_m)] = 2
+        buf_90m[ dist_build_90   <= buf_m]                             = 3
+
+        # Upsample to 30 m treecover grid
+        buf_30m[:] = 0
+        warp_reproject(
+            source=buf_90m, destination=buf_30m,
+            src_transform=cls_sub_transform, src_crs=cls_crs,
+            dst_transform=tc_transform,      dst_crs=tc_crs,
+            resampling=WarpResampling.nearest,
+            src_nodata=0, dst_nodata=0,
+        )
+
+        # Weighted forest area: each pixel contributes (canopy % / 100) × px_area_ha
+        results[f"defor_upgrade_{buf_m}m_ha"] = round(float(((buf_30m == 2) * canopy_frac).sum()) * px_area_ha, 2)
+        results[f"defor_build_{buf_m}m_ha"]   = round(float(((buf_30m == 3) * canopy_frac).sum()) * px_area_ha, 2)
+        results[f"defor_action_{buf_m}m_ha"]  = round(float(((buf_30m >  0) * canopy_frac).sum()) * px_area_ha, 2)
+
+        if save_buffer_rasters:
+            out_fp = out_dir / f"defor_buffer_{buf_m}m_{stem}.tif"
+            with rasterio.open(out_fp, "w", **buf_profile) as dst:
+                dst.write(buf_30m, 1)
+            print(f"    {out_fp.name}")
+
+    return results
+
+
+def print_deforestation(result: dict):
+    print(f"\n  Deforestation risk — forest area within buffer of action roads:")
+    print(f"  {'─'*58}")
+    print(f"  {'Buffer':>10}  {'Upgrade (ha)':>14}  {'New build (ha)':>14}  {'Combined (ha)':>14}")
+    print(f"  {'─'*58}")
+    for d in BUFFER_DISTANCES_M:
+        label = "direct" if d == 0 else f"{d} m"
+        up  = result.get(f"defor_upgrade_{d}m_ha", 0)
+        bld = result.get(f"defor_build_{d}m_ha",   0)
+        act = result.get(f"defor_action_{d}m_ha",  0)
+        print(f"  {label:>10}  {up:>14,.1f}  {bld:>14,.1f}  {act:>14,.1f}")
+    print(f"  {'─'*58}")
+    print(f"  Values are canopy-cover-weighted forest area (canopy % / 100 × pixel area)")
+
 
 # def metric_mining_capacity(paths_gdf, mines_gdf) -> dict:
 #     """Estimate mining capacity unlocked by new road connectivity."""
-#     ...
-
-# def metric_deforestation(path_raster, forest_raster, px_km) -> dict:
-#     """Estimate forest area lost along new road corridors."""
 #     ...
 
 # def metric_forest_fragmentation(path_raster, forest_raster) -> dict:
@@ -356,6 +734,9 @@ def run_assessment(paths_fp: Path, downsample: int = 1) -> pd.DataFrame:
 
     # ── Compute metrics ───────────────────────────────────────────────────────
     print("\n[4/4] Computing metrics …")
+    if not TREECOVER_FP.exists():
+        print(f"  WARNING: treecover raster not found at {TREECOVER_FP}")
+        print(f"  Run notebook/01_clean-forests.py first to generate it.")
 
     # Metric 1: road classification
     road_class, classified_raster = metric_road_classification(path_raster, road_raster, px_km)
@@ -363,12 +744,29 @@ def run_assessment(paths_fp: Path, downsample: int = 1) -> pd.DataFrame:
     save_classified_raster(classified_raster, transform, crs,
                            out_dir / f"classified_{paths_fp.stem}.tif")
 
-    # [Future metrics called here]
+    # Metric 2: construction cost
+    friction = load_friction_values(FRICTION_FP, shape, transform, crs)
+    cost_metrics = metric_construction_cost(classified_raster, friction)
+    print_construction_cost(cost_metrics)
+
+    # Action roads vector file
+    save_classified_lines(paths_gdf, classified_raster, transform, crs,
+                          friction, out_dir, paths_fp.stem)
+
+    # Metric 3: deforestation risk
+    classified_fp = out_dir / f"classified_{paths_fp.stem}.tif"
+    defor_metrics = metric_deforestation(
+        classified_fp,
+        save_buffer_rasters=True,
+        out_dir=out_dir,
+        scenario_stem=paths_fp.stem,
+    )
+    if defor_metrics:
+        print_deforestation(defor_metrics)
 
     # ── Compile results ───────────────────────────────────────────────────────
-    results = {"scenario": paths_fp.stem, **road_class}
-    # results.update(metric_construction_cost(...))
-    # results.update(metric_deforestation(...))
+    results = {"scenario": paths_fp.stem, **road_class, **cost_metrics}
+    results.update(defor_metrics)
 
     results_df = pd.DataFrame([results])
     out_fp = out_dir / f"assessment_{paths_fp.stem}.csv"
