@@ -6,13 +6,13 @@ Takes a generated path GeoPackage (output of path-generator) and computes
 impact metrics for the proposed road network.
 
 Metrics implemented:
-  [1] Road classification — km of paved / unpaved / to_be_built
-  [2] Construction cost   — USD for upgrade and new-build segments
-  [3] Deforestation risk  — ha of forest within buffer zones of action roads
+  [1] Road classification    — km of paved / unpaved / to_be_built
+  [2] Construction cost      — USD for upgrade and new-build segments
+  [3] Deforestation risk     — ha of forest within buffer zones of action roads
+  [4] Forest fragmentation   — new forest patches created by action roads
 
 Metrics to be added:
   [ ] Mining capacity
-  [ ] Increased forest fragmentation
 
 Approach for road classification:
   Rather than vector overlay (slow, needs buffer tolerance), both the path
@@ -58,8 +58,9 @@ FRICTION_FP    = BASE_DIR / "data/output/cmr-construction-cost-friction-90m/cmr_
 TREECOVER_FP   = BASE_DIR / "data/output/processed-hansen-treecover/cameroon_treecover2024_30m.tif"
 
 ROAD_TYPE_COL      = "liu_surface"
-FOREST_THRESHOLD   = 10    # minimum canopy cover (%) to count as forest (FAO-aligned)
-BUFFER_DISTANCES_M = [0, 100, 250, 500, 750, 1000]
+FOREST_THRESHOLD    = 10    # minimum canopy cover (%) to count as forest (FAO-aligned)
+MIN_FOREST_PATCH_HA = 1.0   # minimum patch size (ha) to count as a distinct forest patch
+BUFFER_DISTANCES_M  = [0, 100, 250, 500, 750, 1000]
 
 # =============================================================================
 # REFERENCE GRID
@@ -690,9 +691,241 @@ def print_deforestation(result: dict):
 #     """Estimate mining capacity unlocked by new road connectivity."""
 #     ...
 
-# def metric_forest_fragmentation(path_raster, forest_raster) -> dict:
-#     """Compute forest fragmentation indices along new road corridors."""
-#     ...
+
+# =============================================================================
+# METRIC 4 — Forest fragmentation
+# =============================================================================
+
+def metric_forest_fragmentation(classified_raster_fp: Path,
+                                 road_raster: np.ndarray,
+                                 window_km: float = 100.0,
+                                 out_dir: Path | None = None,
+                                 scenario_stem: str = "") -> dict:
+    """
+    Estimate the increase in number of forest patches caused by action roads.
+
+    Approach: sliding non-overlapping windows across the treecover raster.
+    For each window that contains at least one action road pixel:
+      1. Build a binary forest mask (canopy ≥ FOREST_THRESHOLD %).
+      2. Count connected forest patches BEFORE burning the roads.
+      3. Burn action road pixels (values 2 and 3) to non-forest.
+      4. Count patches AFTER.
+      5. Accumulate the difference.
+
+    Non-overlapping windows avoid double-counting patches that span window
+    boundaries.  Windows with no action roads are skipped for efficiency.
+
+    Returns
+    -------
+    fragmentation_new_patches      : total additional patches across all windows
+    fragmentation_windows_processed: number of windows that contained roads
+    """
+    import math
+    from rasterio.transform import Affine
+    from scipy.ndimage import label as ndimage_label
+    from rasterio.warp import reproject as warp_reproject, Resampling as WarpResampling
+    from rasterio.windows import Window, from_bounds as window_from_bounds
+
+    struct_8 = np.ones((3, 3), dtype=int)   # 8-connectivity for forest patches
+
+    print(f"  Loading classified raster: {classified_raster_fp.name}")
+    with rasterio.open(classified_raster_fp) as cls_src:
+        cls_arr       = cls_src.read(1)
+        cls_transform = cls_src.transform
+        cls_crs       = cls_src.crs
+
+    action_mask = (cls_arr == 2) | (cls_arr == 3)
+    if not action_mask.any():
+        print("  No action roads — fragmentation metric skipped.")
+        return {}
+
+    # Window size in treecover pixels (~30 m)
+    with rasterio.open(TREECOVER_FP) as tc_src:
+        tc_transform = tc_src.transform
+        tc_crs       = tc_src.crs
+        tc_height    = tc_src.height
+        tc_width     = tc_src.width
+
+    lat_c        = tc_transform.f + (tc_height / 2) * tc_transform.e
+    px_size_m    = abs(tc_transform.a) * 111_320 * math.cos(math.radians(lat_c))
+    win_px       = round(window_km * 1_000 / px_size_m)
+    px_area_km2  = (px_size_m ** 2) / 1_000_000
+    min_patch_px = max(1, round((MIN_FOREST_PATCH_HA / 100) / px_area_km2))
+
+    print(f"  Window: {window_km:.0f} km = {win_px} × {win_px} px  |  "
+          f"forest ≥ {FOREST_THRESHOLD}%  |  min patch ≥ {MIN_FOREST_PATCH_HA} ha ({min_patch_px} px)")
+
+    n_windows              = 0
+    n_windows_action_roads = 0
+    total_patches_before   = 0
+    total_patches_after    = 0
+
+    # Output grids: one cell per window
+    grid_rows = math.ceil(tc_height / win_px)
+    grid_cols = math.ceil(tc_width  / win_px)
+    _nan = float("nan")
+    grid_index_before  = np.full((grid_rows, grid_cols), _nan, dtype=np.float32)
+    grid_index_after   = np.full((grid_rows, grid_cols), _nan, dtype=np.float32)
+    grid_patches_before = np.full((grid_rows, grid_cols), -1,  dtype=np.int32)
+    grid_patches_after  = np.full((grid_rows, grid_cols), -1,  dtype=np.int32)
+
+    with rasterio.open(TREECOVER_FP) as tc_src:
+        for row_off in range(0, tc_height, win_px):
+            for col_off in range(0, tc_width, win_px):
+                grid_r = row_off // win_px
+                grid_c = col_off // win_px
+
+                win_h = min(win_px, tc_height - row_off)
+                win_w = min(win_px, tc_width  - col_off)
+                window        = Window(col_off, row_off, win_w, win_h)
+                win_transform = tc_src.window_transform(window)
+
+                # Quick overlap check using the 90 m classified raster
+                w_left   = win_transform.c
+                w_top    = win_transform.f
+                w_right  = w_left + win_w * win_transform.a
+                w_bottom = w_top  + win_h * win_transform.e
+
+                cls_win = window_from_bounds(w_left, w_bottom, w_right, w_top,
+                                             cls_transform)
+                cls_win = cls_win.round_lengths().round_offsets()
+                r0 = max(0, int(cls_win.row_off))
+                r1 = min(cls_arr.shape[0], r0 + int(cls_win.height))
+                c0 = max(0, int(cls_win.col_off))
+                c1 = min(cls_arr.shape[1], c0 + int(cls_win.width))
+
+                if r1 <= r0 or c1 <= c0:
+                    continue
+
+                has_action = ((cls_arr[r0:r1, c0:c1] == 2) |
+                              (cls_arr[r0:r1, c0:c1] == 3)).any()
+
+                # Read treecover — forest extent is the shared denominator
+                tc_win    = tc_src.read(1, window=window)
+                forest    = (tc_win >= FOREST_THRESHOLD).astype(np.uint8)
+                forest_px = int(forest.sum())
+                if forest_px < 2:
+                    continue
+
+                # Reproject both rasters onto this window's 30 m grid
+                cls_repr  = np.zeros((win_h, win_w), dtype=np.uint8)
+                road_repr = np.zeros((win_h, win_w), dtype=np.uint8)
+                warp_reproject(
+                    source=cls_arr, destination=cls_repr,
+                    src_transform=cls_transform, src_crs=cls_crs,
+                    dst_transform=win_transform, dst_crs=tc_crs,
+                    resampling=WarpResampling.nearest,
+                    src_nodata=0, dst_nodata=0,
+                )
+                warp_reproject(
+                    source=road_raster, destination=road_repr,
+                    src_transform=cls_transform, src_crs=cls_crs,
+                    dst_transform=win_transform, dst_crs=tc_crs,
+                    resampling=WarpResampling.nearest,
+                    src_nodata=0, dst_nodata=0,
+                )
+
+                # Before: existing road network burned
+                forest_before = forest.copy()
+                forest_before[road_repr > 0] = 0
+                labeled_before, _ = ndimage_label(forest_before, structure=struct_8)
+                if labeled_before.max() > 0:
+                    sizes_before = np.bincount(labeled_before.ravel())
+                    n_before = int((sizes_before[1:] >= min_patch_px).sum())
+                else:
+                    n_before = 0
+
+                # After: additionally burn action roads
+                forest_after = forest_before.copy()
+                forest_after[(cls_repr == 2) | (cls_repr == 3)] = 0
+                labeled_after, _ = ndimage_label(forest_after, structure=struct_8)
+                if labeled_after.max() > 0:
+                    sizes_after = np.bincount(labeled_after.ravel())
+                    n_after = int((sizes_after[1:] >= min_patch_px).sum())
+                else:
+                    n_after = 0
+
+                forest_km2 = forest_px * px_area_km2
+                denom = max(forest_km2 - 1, 1e-9)
+                grid_index_before [grid_r, grid_c] = (n_before - 1) / denom
+                grid_index_after  [grid_r, grid_c] = (n_after  - 1) / denom
+                grid_patches_before[grid_r, grid_c] = n_before
+                grid_patches_after [grid_r, grid_c] = n_after
+
+                total_patches_before += n_before
+                total_patches_after  += n_after
+                n_windows += 1
+                if has_action:
+                    n_windows_action_roads += 1
+
+    # Country-level index: sum patches across all windows / total forest pixels
+    # (approximated as sum-of-window patches over sum-of-window forest extents)
+    # Re-read full treecover for exact country totals
+    with rasterio.open(TREECOVER_FP) as tc_src:
+        # Read in blocks to avoid loading the full raster at once
+        total_forest_px = 0
+        for _, block_win in tc_src.block_windows(1):
+            blk = tc_src.read(1, window=block_win)
+            total_forest_px += int((blk >= FOREST_THRESHOLD).sum())
+
+    total_forest_km2     = total_forest_px * px_area_km2
+    country_index_before = (total_patches_before - 1) / max(total_forest_km2 - 1, 1e-9)
+    country_index_after  = (total_patches_after  - 1) / max(total_forest_km2 - 1, 1e-9)
+
+    # Save index_before and index_after grids (one pixel = one window)
+    if out_dir is not None:
+        win_label      = f"{int(window_km)}km"
+        grid_transform = Affine(
+            win_px * tc_transform.a, 0.0, tc_transform.c,
+            0.0, win_px * tc_transform.e, tc_transform.f,
+        )
+        grid_common = dict(
+            driver="GTiff", count=1, width=grid_cols, height=grid_rows,
+            crs=tc_crs, transform=grid_transform, compress="lzw",
+        )
+        files = [
+            (f"fragmentation_index_before_{win_label}_{scenario_stem}.tif",   "float32", _nan,  grid_index_before),
+            (f"fragmentation_index_after_{win_label}_{scenario_stem}.tif",    "float32", _nan,  grid_index_after),
+            (f"fragmentation_patches_before_{win_label}_{scenario_stem}.tif", "int32",   -1,    grid_patches_before),
+            (f"fragmentation_patches_after_{win_label}_{scenario_stem}.tif",  "int32",   -1,    grid_patches_after),
+        ]
+        for fname, dtype, nodata, arr in files:
+            fp = out_dir / fname
+            with rasterio.open(fp, "w", dtype=dtype, nodata=nodata, **grid_common) as dst:
+                dst.write(arr, 1)
+            print(f"  Saved → {fp.name}")
+
+    print(f"  Windows processed: {n_windows}  |  with action roads: {n_windows_action_roads}")
+    win_label = f"{int(window_km)}km"
+    return {
+        f"fragmentation_patches_before_{win_label}":              total_patches_before,
+        f"fragmentation_patches_after_{win_label}":               total_patches_after,
+        f"fragmentation_index_before_{win_label}":                round(country_index_before, 8),
+        f"fragmentation_index_after_{win_label}":                 round(country_index_after,  8),
+        f"fragmentation_n_windows_with_action_roads_{win_label}": n_windows_action_roads,
+    }
+
+
+def print_forest_fragmentation(results: dict):
+    window_sizes = [10, 50, 100, 150]
+    print(f"\n  Forest fragmentation (sensitivity test):")
+    print(f"  {'─'*80}")
+    print(f"  {'Window':>10}  {'Patches before':>16}  {'Patches after':>15}  {'Index before':>13}  {'Index after':>12}")
+    print(f"  {'─'*80}")
+    for w in window_sizes:
+        label   = f"{w} km"
+        pb      = results.get(f"fragmentation_patches_before_{w}km", "—")
+        pa      = results.get(f"fragmentation_patches_after_{w}km",  "—")
+        ib      = results.get(f"fragmentation_index_before_{w}km",   "—")
+        ia      = results.get(f"fragmentation_index_after_{w}km",    "—")
+        pb_str  = f"{pb:,}"      if isinstance(pb, int)   else pb
+        pa_str  = f"{pa:,}"      if isinstance(pa, int)   else pa
+        ib_str  = f"{ib:.6f}"   if isinstance(ib, float) else ib
+        ia_str  = f"{ia:.6f}"   if isinstance(ia, float) else ia
+        print(f"  {label:>10}  {pb_str:>16}  {pa_str:>15}  {ib_str:>13}  {ia_str:>12}")
+    print(f"  {'─'*80}")
+    print(f"  (non-overlapping windows, 8-connectivity, forest ≥ {FOREST_THRESHOLD}% canopy, "
+          f"min patch ≥ {MIN_FOREST_PATCH_HA} ha, index unit: patches per km²)")
 
 
 # =============================================================================
@@ -764,9 +997,20 @@ def run_assessment(paths_fp: Path, downsample: int = 1) -> pd.DataFrame:
     if defor_metrics:
         print_deforestation(defor_metrics)
 
+    # Metric 4: forest fragmentation (sensitivity test across window sizes)
+    frag_metrics = {}
+    for win_km in [10, 50, 100, 150]:
+        frag_metrics.update(metric_forest_fragmentation(
+            classified_fp, road_raster=road_raster, window_km=win_km,
+            out_dir=out_dir, scenario_stem=paths_fp.stem,
+        ))
+    if frag_metrics:
+        print_forest_fragmentation(frag_metrics)
+
     # ── Compile results ───────────────────────────────────────────────────────
     results = {"scenario": paths_fp.stem, **road_class, **cost_metrics}
     results.update(defor_metrics)
+    results.update(frag_metrics)
 
     results_df = pd.DataFrame([results])
     out_fp = out_dir / f"assessment_{paths_fp.stem}.csv"
