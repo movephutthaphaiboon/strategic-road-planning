@@ -8,7 +8,7 @@ impact metrics for the proposed road network.
 Metrics implemented:
   [1] Road classification    — km of paved / unpaved / to_be_built
   [2] Construction cost      — USD for upgrade and new-build segments
-  [3] Deforestation risk     — ha of forest within buffer zones of action roads
+  [3] Deforestation risk     — expected forest cleared using Damania et al. (2018) distance-decay
   [4] Forest fragmentation   — new forest patches created by action roads
 
 Metrics to be added:
@@ -49,18 +49,43 @@ from shapely.ops import unary_union
 warnings.filterwarnings("ignore")
 
 # =============================================================================
+# CONFIGURATION  ← edit here to control what gets computed and saved
+# =============================================================================
+
+# --- Metrics to run ----------------------------------------------------------
+RUN_ROAD_CLASSIFICATION = True   # paved / unpaved / new-build km
+RUN_CONSTRUCTION_COST   = True   # USD cost for upgrade and new-build
+RUN_DEFORESTATION       = True   # expected forest cleared using Damania et al. (2018) distance-decay
+RUN_FRAGMENTATION       = True   # forest patch count and fragmentation index (slow)
+
+# --- Deforestation settings (Damania et al. 2018) ----------------------------
+DAMANIA_CURVE       = "good"   # road quality curve: "good", "fair", "poor", "very_poor"
+DAMANIA_MAX_DIST_KM = 10.0     # maximum distance to apply the clearing decay (km)
+SAVE_DEFOR_RASTER   = True     # save expected-clearing raster (float32, km² per pixel)
+
+# --- Fragmentation settings --------------------------------------------------
+FRAGMENTATION_WINDOW_KM  = [50, 100]   # window sizes in km (larger = faster)
+MIN_FOREST_PATCH_KM2     = 0.01        # minimum patch size (km²) to count as a patch — 0.01 km² = 1 ha
+
+# --- Forest definition -------------------------------------------------------
+FOREST_THRESHOLD = 10   # minimum canopy cover (%) — FAO definition
+
+# =============================================================================
 # PATHS
 # =============================================================================
 
-BASE_DIR       = Path(__file__).parent.parent
-ROADS_FP       = BASE_DIR / "data/output/processed_roads_official/cleaned_merged_osm_heigit_liu-ver3-midterm.gpkg"
-FRICTION_FP    = BASE_DIR / "data/output/cmr-construction-cost-friction-90m/cmr_friction_90m_clipped.tif"
-TREECOVER_FP   = BASE_DIR / "data/output/processed-hansen-treecover/cameroon_treecover2024_30m.tif"
+BASE_DIR          = Path(__file__).parent.parent
+ROADS_FP          = BASE_DIR / "data/output/processed_roads_official/cleaned_merged_osm_heigit_liu-ver3-midterm.gpkg"
+FRICTION_FP       = BASE_DIR / "data/output/cmr-construction-cost-friction-90m/cmr_friction_90m_clipped.tif"
+TREECOVER_FP      = BASE_DIR / "data/output/processed-hansen-treecover/cameroon_treecover2024_30m.tif"
+DAMANIA_LOOKUP_FP = BASE_DIR / "data/input/damania-deforestation-lookup/damania_pct_cleared.csv"
 
-ROAD_TYPE_COL      = "liu_surface"
-FOREST_THRESHOLD    = 10    # minimum canopy cover (%) to count as forest (FAO-aligned)
-MIN_FOREST_PATCH_HA = 1.0   # minimum patch size (ha) to count as a distinct forest patch
-BUFFER_DISTANCES_M  = [0, 100, 250, 500, 750, 1000]
+ROAD_TYPE_COL = "liu_surface"
+
+# --- Load Damania lookup at module level (interpolated at runtime) ------------
+_damania_df   = pd.read_csv(DAMANIA_LOOKUP_FP)
+_damania_dist = _damania_df["distance_km"].values.astype(np.float32)
+_damania_pct  = (_damania_df[f"pct_cleared_{DAMANIA_CURVE}"].values / 100.0).astype(np.float32)
 
 # =============================================================================
 # REFERENCE GRID
@@ -480,47 +505,26 @@ def print_construction_cost(result: dict):
 # =============================================================================
 
 def metric_deforestation(classified_raster_fp: Path,
-                         save_buffer_rasters: bool = False,
                          out_dir: Path = None,
                          scenario_stem: str = None) -> dict:
     """
-    Estimate the area of forest at risk of deforestation from road actions.
+    Estimate expected forest cleared using the Damania et al. (2018) distance-decay.
 
-    Reads the classified raster produced by save_classified_raster() and the
-    30 m Hansen tree-cover layer.  For pixels classified as 'unpaved' (upgrade)
-    or 'to_be_built' (new construction), counts how much forest falls within
-    each of several buffer distances from those roads.
+    For each 30 m pixel, the expected clearing equals:
+        canopy_frac × pct_cleared(distance_to_nearest_action_road) × pixel_area_km²
 
-    Buffer distances: 0 m (road footprint only), 100, 250, 500, 750, 1000 m.
+    where pct_cleared is linearly interpolated from the Damania lookup table
+    (empirical % of land cleared at a given distance from roads of known quality,
+    derived from cross-sectional data across Sub-Saharan Africa).
 
-    No double-counting: rasterize_paths() already calls unary_union() before
-    burning, so shared segments across multiple mines are merged into one
-    geometry.  The distance transform then runs on a binary mask — each pixel
-    is counted once regardless of how many mines use that corridor.
+    EDT runs at 90 m on a cropped subregion (low memory), then the resulting
+    % surfaces are upsampled to 30 m with bilinear resampling before counting.
+    Build takes priority over upgrade where both zones overlap.
 
-    Strategy
-    --------
-    1. Load the classified raster and the treecover window that covers the
-       action-road bounding box plus 1 km padding.
-    2. Reproject the classified raster to the 30 m treecover pixel grid
-       (nearest-neighbour, preserving class values).
-    3. Compute one Euclidean distance transform per road class (upgrade / build).
-       The combined (action) distance is np.minimum of the two — no third EDT.
-    4. Threshold at each buffer distance → upsample to 30 m → weighted sum → ha.
-
-    Optional raster output (save_buffer_rasters=True)
-    -------------------------------------------------
-    Saves one GeoTIFF per buffer distance to out_dir, named:
-        defor_buffer_{buf_m}m_{scenario_stem}.tif
-    Pixel values match the classified raster convention:
-        0 = not in any action-road buffer
-        2 = within buffer of a road to be upgraded
-        3 = within buffer of a road to be built  (overwrites 2 where both overlap)
-
-    Returns keys (per class × buffer):
-        defor_upgrade_Xm_ha  — forest within X m of roads to be upgraded
-        defor_build_Xm_ha    — forest within X m of roads to be built
-        defor_action_Xm_ha   — combined (upgrade + build)
+    Returns keys:
+        defor_upgrade_km2  — expected km² cleared near roads to be upgraded
+        defor_build_km2    — expected km² cleared near roads to be built
+        defor_action_km2   — combined (upgrade + build)
     """
     import math
     from scipy.ndimage import distance_transform_edt
@@ -553,7 +557,7 @@ def metric_deforestation(classified_raster_fp: Path,
     r_min, r_max = int(rows.min()), int(rows.max())
     c_min, c_max = int(cols.min()), int(cols.max())
 
-    px_pad = math.ceil((BUFFER_DISTANCES_M[-1] + 200) / cls_px_size_m)
+    px_pad = math.ceil((DAMANIA_MAX_DIST_KM * 1000 + 200) / cls_px_size_m)
     r0 = max(0, r_min - px_pad);  r1 = min(cls_arr.shape[0], r_max + px_pad + 1)
     c0 = max(0, c_min - px_pad);  c1 = min(cls_arr.shape[1], c_max + px_pad + 1)
 
@@ -598,17 +602,17 @@ def metric_deforestation(classified_raster_fp: Path,
     print(f"  Treecover window: {tc_shape[0]:,} rows × {tc_shape[1]:,} cols "
           f"(~{tc_shape[0]*30/1000:.0f} km × {tc_shape[1]*30/1000:.0f} km at 30 m)")
 
-    # Pixel area at 30 m (used for ha counts)
-    lat_tc     = tc_transform.f + (tc_shape[0] / 2) * tc_transform.e
-    px_m_x     = abs(tc_transform.a) * 111_320 * math.cos(math.radians(lat_tc))
-    px_m_y     = abs(tc_transform.e) * 111_320
-    px_area_ha = px_m_x * px_m_y / 10_000
+    # Pixel area at 30 m (used for km² counts)
+    lat_tc      = tc_transform.f + (tc_shape[0] / 2) * tc_transform.e
+    px_m_x      = abs(tc_transform.a) * 111_320 * math.cos(math.radians(lat_tc))
+    px_m_y      = abs(tc_transform.e) * 111_320
+    px_area_km2 = px_m_x * px_m_y / 1_000_000
 
     # Canopy fraction (0.0–1.0) — used to weight each pixel's contribution.
-    # A pixel with 80% cover counts as 0.8 × px_area_ha of forest.
+    # A pixel with 80% cover counts as 0.8 × px_area_km2 of forest.
     canopy_frac = tc_arr.astype(np.float32) / 100.0
     print(f"  Total canopy-weighted forest area in window: "
-          f"{float(canopy_frac.sum() * px_area_ha):,.0f} ha")
+          f"{float(canopy_frac.sum() * px_area_km2):,.2f} km²")
 
     # ── Distance transforms at 90 m (small array) ─────────────────────────────
     # Scipy distance_transform_edt allocates float64 internally — running on the
@@ -624,67 +628,80 @@ def metric_deforestation(classified_raster_fp: Path,
     dist_build_90   = (distance_transform_edt(~mask_build).astype(np.float32) * cls_px_size_m
                        if mask_build.any() else _inf_sub)
 
-    # ── Per-buffer: upsample 90 m mask → 30 m, count forest, save raster ──────
-    # Build the combined uint8 mask at 90 m for each buffer distance, upsample
-    # to the 30 m treecover grid (nearest-neighbour), then count.  buf_30m is
-    # reused each iteration to avoid accumulating large arrays.
-    if save_buffer_rasters:
+    # ── Damania distance-decay: expected forest cleared ───────────────────────
+    # For each 90 m pixel, look up the % of land cleared at that distance from
+    # the nearest action road (Damania et al. 2018, "Good" quality curve).
+    # Build takes priority where upgrade and build zones overlap.
+    dist_upgrade_km = dist_upgrade_90 / 1000.0
+    dist_build_km   = dist_build_90   / 1000.0
+
+    pct_upgrade = np.where(
+        dist_upgrade_km <= DAMANIA_MAX_DIST_KM,
+        np.interp(dist_upgrade_km, _damania_dist, _damania_pct), 0.0,
+    ).astype(np.float32)
+    pct_build = np.where(
+        dist_build_km <= DAMANIA_MAX_DIST_KM,
+        np.interp(dist_build_km, _damania_dist, _damania_pct), 0.0,
+    ).astype(np.float32)
+
+    # Where build is closer, zero out the upgrade contribution
+    pct_upgrade = np.where(dist_build_km < dist_upgrade_km, 0.0, pct_upgrade).astype(np.float32)
+
+    # Upsample both % surfaces to 30 m treecover grid (bilinear for smooth decay)
+    pct_upgrade_30 = np.zeros(tc_shape, dtype=np.float32)
+    pct_build_30   = np.zeros(tc_shape, dtype=np.float32)
+    warp_reproject(
+        source=pct_upgrade, destination=pct_upgrade_30,
+        src_transform=cls_sub_transform, src_crs=cls_crs,
+        dst_transform=tc_transform,      dst_crs=tc_crs,
+        resampling=WarpResampling.bilinear, src_nodata=0, dst_nodata=0,
+    )
+    warp_reproject(
+        source=pct_build, destination=pct_build_30,
+        src_transform=cls_sub_transform, src_crs=cls_crs,
+        dst_transform=tc_transform,      dst_crs=tc_crs,
+        resampling=WarpResampling.bilinear, src_nodata=0, dst_nodata=0,
+    )
+
+    # Expected cleared forest per pixel = canopy_frac × pct_cleared × px_area_km2
+    cleared_upgrade = canopy_frac * pct_upgrade_30 * px_area_km2
+    cleared_build   = canopy_frac * pct_build_30   * px_area_km2
+    cleared_action  = cleared_upgrade + cleared_build
+
+    results = {
+        "defor_upgrade_km2": round(float(cleared_upgrade.sum()), 4),
+        "defor_build_km2":   round(float(cleared_build.sum()),   4),
+        "defor_action_km2":  round(float(cleared_action.sum()),  4),
+    }
+
+    if SAVE_DEFOR_RASTER:
         if out_dir is None:
-            raise ValueError("out_dir must be provided when save_buffer_rasters=True")
+            raise ValueError("out_dir must be provided when SAVE_DEFOR_RASTER=True")
         stem = scenario_stem or classified_raster_fp.stem
-        buf_profile = {
-            "driver": "GTiff", "dtype": np.uint8, "nodata": 0,
+        defor_profile = {
+            "driver": "GTiff", "dtype": np.float32, "nodata": float("nan"),
             "width": tc_shape[1], "height": tc_shape[0], "count": 1,
             "crs": tc_crs, "transform": tc_transform, "compress": "lzw",
         }
-        print(f"  Saving buffer rasters to {out_dir} ...")
-
-    results = {}
-    buf_30m = np.zeros(tc_shape, dtype=np.uint8)   # reused each iteration
-
-    for buf_m in BUFFER_DISTANCES_M:
-        # 90 m buffer mask: build takes priority over upgrade where they overlap
-        buf_90m = np.zeros(cls_sub.shape, dtype=np.uint8)
-        buf_90m[(dist_upgrade_90 <= buf_m) & (dist_build_90 > buf_m)] = 2
-        buf_90m[ dist_build_90   <= buf_m]                             = 3
-
-        # Upsample to 30 m treecover grid
-        buf_30m[:] = 0
-        warp_reproject(
-            source=buf_90m, destination=buf_30m,
-            src_transform=cls_sub_transform, src_crs=cls_crs,
-            dst_transform=tc_transform,      dst_crs=tc_crs,
-            resampling=WarpResampling.nearest,
-            src_nodata=0, dst_nodata=0,
-        )
-
-        # Weighted forest area: each pixel contributes (canopy % / 100) × px_area_ha
-        results[f"defor_upgrade_{buf_m}m_ha"] = round(float(((buf_30m == 2) * canopy_frac).sum()) * px_area_ha, 2)
-        results[f"defor_build_{buf_m}m_ha"]   = round(float(((buf_30m == 3) * canopy_frac).sum()) * px_area_ha, 2)
-        results[f"defor_action_{buf_m}m_ha"]  = round(float(((buf_30m >  0) * canopy_frac).sum()) * px_area_ha, 2)
-
-        if save_buffer_rasters:
-            out_fp = out_dir / f"defor_buffer_{buf_m}m_{stem}.tif"
-            with rasterio.open(out_fp, "w", **buf_profile) as dst:
-                dst.write(buf_30m, 1)
-            print(f"    {out_fp.name}")
+        out_fp = out_dir / f"defor_expected_{stem}.tif"
+        with rasterio.open(out_fp, "w", **defor_profile) as dst:
+            dst.write(cleared_action, 1)
+        print(f"  Saved → {out_fp.name}")
 
     return results
 
 
 def print_deforestation(result: dict):
-    print(f"\n  Deforestation risk — forest area within buffer of action roads:")
+    up  = result.get("defor_upgrade_km2", 0)
+    bld = result.get("defor_build_km2",   0)
+    act = result.get("defor_action_km2",  0)
+    print(f"\n  Deforestation risk — expected forest cleared (Damania et al. 2018, {DAMANIA_CURVE} road, 0–{DAMANIA_MAX_DIST_KM:.0f} km decay):")
     print(f"  {'─'*58}")
-    print(f"  {'Buffer':>10}  {'Upgrade (ha)':>14}  {'New build (ha)':>14}  {'Combined (ha)':>14}")
+    print(f"  {'':>12}  {'Upgrade (km²)':>15}  {'New build (km²)':>15}  {'Combined (km²)':>15}")
     print(f"  {'─'*58}")
-    for d in BUFFER_DISTANCES_M:
-        label = "direct" if d == 0 else f"{d} m"
-        up  = result.get(f"defor_upgrade_{d}m_ha", 0)
-        bld = result.get(f"defor_build_{d}m_ha",   0)
-        act = result.get(f"defor_action_{d}m_ha",  0)
-        print(f"  {label:>10}  {up:>14,.1f}  {bld:>14,.1f}  {act:>14,.1f}")
+    print(f"  {'Expected':>12}  {up:>15,.3f}  {bld:>15,.3f}  {act:>15,.3f}")
     print(f"  {'─'*58}")
-    print(f"  Values are canopy-cover-weighted forest area (canopy % / 100 × pixel area)")
+    print(f"  Formula: Σ_pixels [ canopy_frac × pct_cleared(distance) × pixel_area_km² ]")
 
 
 # def metric_mining_capacity(paths_gdf, mines_gdf) -> dict:
@@ -750,10 +767,10 @@ def metric_forest_fragmentation(classified_raster_fp: Path,
     px_size_m    = abs(tc_transform.a) * 111_320 * math.cos(math.radians(lat_c))
     win_px       = round(window_km * 1_000 / px_size_m)
     px_area_km2  = (px_size_m ** 2) / 1_000_000
-    min_patch_px = max(1, round((MIN_FOREST_PATCH_HA / 100) / px_area_km2))
+    min_patch_px = max(1, round(MIN_FOREST_PATCH_KM2 / px_area_km2))
 
     print(f"  Window: {window_km:.0f} km = {win_px} × {win_px} px  |  "
-          f"forest ≥ {FOREST_THRESHOLD}%  |  min patch ≥ {MIN_FOREST_PATCH_HA} ha ({min_patch_px} px)")
+          f"forest ≥ {FOREST_THRESHOLD}%  |  min patch ≥ {MIN_FOREST_PATCH_KM2} km² ({min_patch_px} px)")
 
     n_windows              = 0
     n_windows_action_roads = 0
@@ -883,11 +900,24 @@ def metric_forest_fragmentation(classified_raster_fp: Path,
             driver="GTiff", count=1, width=grid_cols, height=grid_rows,
             crs=tc_crs, transform=grid_transform, compress="lzw",
         )
+        grid_patches_delta = np.where(
+            (grid_patches_before >= 0) & (grid_patches_after >= 0),
+            grid_patches_after - grid_patches_before,
+            -1,
+        ).astype(np.int32)
+        grid_index_delta = np.where(
+            np.isfinite(grid_index_before) & np.isfinite(grid_index_after),
+            grid_index_after - grid_index_before,
+            _nan,
+        ).astype(np.float32)
+
         files = [
-            (f"fragmentation_index_before_{win_label}_{scenario_stem}.tif",   "float32", _nan,  grid_index_before),
-            (f"fragmentation_index_after_{win_label}_{scenario_stem}.tif",    "float32", _nan,  grid_index_after),
-            (f"fragmentation_patches_before_{win_label}_{scenario_stem}.tif", "int32",   -1,    grid_patches_before),
-            (f"fragmentation_patches_after_{win_label}_{scenario_stem}.tif",  "int32",   -1,    grid_patches_after),
+            (f"fragmentation_patches_before_{win_label}_{scenario_stem}.tif", "int32",   -1,   grid_patches_before),
+            (f"fragmentation_patches_after_{win_label}_{scenario_stem}.tif",  "int32",   -1,   grid_patches_after),
+            (f"fragmentation_patches_delta_{win_label}_{scenario_stem}.tif",  "int32",   -1,   grid_patches_delta),
+            (f"fragmentation_index_before_{win_label}_{scenario_stem}.tif",   "float32", _nan, grid_index_before),
+            (f"fragmentation_index_after_{win_label}_{scenario_stem}.tif",    "float32", _nan, grid_index_after),
+            (f"fragmentation_index_delta_{win_label}_{scenario_stem}.tif",    "float32", _nan, grid_index_delta),
         ]
         for fname, dtype, nodata, arr in files:
             fp = out_dir / fname
@@ -907,7 +937,7 @@ def metric_forest_fragmentation(classified_raster_fp: Path,
 
 
 def print_forest_fragmentation(results: dict):
-    window_sizes = [10, 50, 100, 150]
+    window_sizes = FRAGMENTATION_WINDOW_KM
     print(f"\n  Forest fragmentation (sensitivity test):")
     print(f"  {'─'*80}")
     print(f"  {'Window':>10}  {'Patches before':>16}  {'Patches after':>15}  {'Index before':>13}  {'Index after':>12}")
@@ -925,7 +955,7 @@ def print_forest_fragmentation(results: dict):
         print(f"  {label:>10}  {pb_str:>16}  {pa_str:>15}  {ib_str:>13}  {ia_str:>12}")
     print(f"  {'─'*80}")
     print(f"  (non-overlapping windows, 8-connectivity, forest ≥ {FOREST_THRESHOLD}% canopy, "
-          f"min patch ≥ {MIN_FOREST_PATCH_HA} ha, index unit: patches per km²)")
+          f"min patch ≥ {MIN_FOREST_PATCH_KM2} km², index unit: patches per km²)")
 
 
 # =============================================================================
@@ -978,34 +1008,36 @@ def run_assessment(paths_fp: Path, downsample: int = 1) -> pd.DataFrame:
                            out_dir / f"classified_{paths_fp.stem}.tif")
 
     # Metric 2: construction cost
-    friction = load_friction_values(FRICTION_FP, shape, transform, crs)
-    cost_metrics = metric_construction_cost(classified_raster, friction)
-    print_construction_cost(cost_metrics)
-
-    # Action roads vector file
-    save_classified_lines(paths_gdf, classified_raster, transform, crs,
-                          friction, out_dir, paths_fp.stem)
+    cost_metrics = {}
+    if RUN_CONSTRUCTION_COST:
+        friction = load_friction_values(FRICTION_FP, shape, transform, crs)
+        cost_metrics = metric_construction_cost(classified_raster, friction)
+        print_construction_cost(cost_metrics)
+        save_classified_lines(paths_gdf, classified_raster, transform, crs,
+                              friction, out_dir, paths_fp.stem)
 
     # Metric 3: deforestation risk
     classified_fp = out_dir / f"classified_{paths_fp.stem}.tif"
-    defor_metrics = metric_deforestation(
-        classified_fp,
-        save_buffer_rasters=True,
-        out_dir=out_dir,
-        scenario_stem=paths_fp.stem,
-    )
-    if defor_metrics:
-        print_deforestation(defor_metrics)
+    defor_metrics = {}
+    if RUN_DEFORESTATION:
+        defor_metrics = metric_deforestation(
+            classified_fp,
+            out_dir=out_dir,
+            scenario_stem=paths_fp.stem,
+        )
+        if defor_metrics:
+            print_deforestation(defor_metrics)
 
-    # Metric 4: forest fragmentation (sensitivity test across window sizes)
+    # Metric 4: forest fragmentation
     frag_metrics = {}
-    for win_km in [10, 50, 100, 150]:
-        frag_metrics.update(metric_forest_fragmentation(
-            classified_fp, road_raster=road_raster, window_km=win_km,
-            out_dir=out_dir, scenario_stem=paths_fp.stem,
-        ))
-    if frag_metrics:
-        print_forest_fragmentation(frag_metrics)
+    if RUN_FRAGMENTATION:
+        for win_km in FRAGMENTATION_WINDOW_KM:
+            frag_metrics.update(metric_forest_fragmentation(
+                classified_fp, road_raster=road_raster, window_km=win_km,
+                out_dir=out_dir, scenario_stem=paths_fp.stem,
+            ))
+        if frag_metrics:
+            print_forest_fragmentation(frag_metrics)
 
     # ── Compile results ───────────────────────────────────────────────────────
     results = {"scenario": paths_fp.stem, **road_class, **cost_metrics}
