@@ -5,8 +5,13 @@ Memory-efficient approach — no full mosaic is ever held in RAM:
   1. Snap the output extent to the Hansen pixel grid (buffer bounding box).
   2. Create an empty output GeoTIFF at that extent.
   3. For each tile pair, read only the window that overlaps the output,
-     zero out tree cover where lossyear > 0, and write to the output file.
+     zero out tree cover where lossyear > 0 OR JRC GFC 2020 == 0,
+     and write to the output file.
   4. Apply the buffer polygon as a vector mask block-by-block.
+
+Masking logic (pixel kept only if BOTH conditions are true):
+  - lossyear == 0  (no Hansen-detected loss 2001–2024)
+  - JRC 2020 == 1  (confirmed forest in 2020 by JRC GFC)
 """
 
 import math
@@ -24,6 +29,7 @@ from rasterio.windows import Window
 BASE = Path(__file__).resolve().parents[1]
 HANSEN_DIR = BASE / "data/input/global-forest-change-hansen"
 BUFFER_PATH = BASE / "data/input/cmr_admin_boundaries_humdata/cmr-buffer.gpkg"
+JRC_MASK_PATH = BASE / "data/output/processed-jrc-treecover/cameroon_jrc_forest2020_30m.tif"
 OUT_DIR = BASE / "data/output/processed-hansen-treecover"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -151,8 +157,13 @@ with rasterio.open(out_path, "w", **out_profile) as out_ds:
         with rasterio.open(ly_path) as ly_src:
             ly_data = ly_src.read(1, window=src_window)
 
-        # Zero tree cover where loss occurred (lossyear > 0 → loss in 2001-2024)
-        tc_data[ly_data > 0] = 0
+        # JRC mask is at the same 30m grid as the output, so use out_window directly
+        with rasterio.open(JRC_MASK_PATH) as jrc_src:
+            jrc_data = jrc_src.read(1, window=out_window)
+
+        # Keep treecover2000 value only where: no loss AND JRC confirms forest in 2020
+        tc_data[ly_data > 0]  = 0
+        tc_data[jrc_data != 1] = 0
 
         out_ds.write(tc_data, 1, window=out_window)
         print(f"  Written: {inter_h} rows × {inter_w} cols → output window "
