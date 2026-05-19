@@ -56,11 +56,17 @@ class PatchConfig:
 # ---------------------------------------------------------------------------
 
 def _load_treecover_90m(treecover_path: Path):
-    """Read treecover at 90 m (3× downsample from 30 m) using average resampling."""
+    """Read treecover resampled to ~90 m using average resampling.
+
+    Scale is computed from the actual pixel size so the function handles both
+    30 m inputs (scale=3) and inputs already at ~90 m (scale=1).
+    """
+    TARGET_M = 90.0
     with rasterio.open(treecover_path) as src:
-        scale = 3
+        px_m = abs(src.transform.a) * 111_320   # approximate metres per pixel
+        scale = max(1, round(TARGET_M / px_m))
         out_h = src.height // scale
-        out_w = src.width // scale
+        out_w = src.width  // scale
         arr = src.read(
             1,
             out_shape=(out_h, out_w),
