@@ -3,6 +3,7 @@ Forest patch detection — experiment runner.
 
 Edit the EXPERIMENTS list below to configure which combinations to run.
 Each entry is a PatchConfig. Results are saved to OUTPUT_DIR.
+Imports from forest_patch_detection.py (underscore filename = importable as a module).
 
 Usage
 -----
@@ -11,17 +12,9 @@ python forest-patch-detection-run.py --dry-run
 """
 
 import argparse
-import importlib.util
 from pathlib import Path
 
-# Load forest-patch-detection.py by file path (hyphens are not valid in module names)
-_spec = importlib.util.spec_from_file_location(
-    "forest_patch_detection", Path(__file__).parent / "forest-patch-detection.py"
-)
-_fpd = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_fpd)
-PatchConfig         = _fpd.PatchConfig
-run_patch_detection = _fpd.run_patch_detection
+from forest_patch_detection import PatchConfig, run_patch_detection
 
 # ---------------------------------------------------------------------------
 # Paths
