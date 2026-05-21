@@ -959,9 +959,14 @@ def metric_forest_fragmentation(scenario_stem: str,
 # MAIN
 # =============================================================================
 
-def run_assessment(paths_fp: Path, downsample: int = 1) -> pd.DataFrame:
+def run_assessment(paths_fp: Path, downsample: int = 1,
+                   out_dir: Path = None) -> pd.DataFrame:
     """
     Run all implemented impact metrics for a given path scenario.
+
+    out_dir : directory where all output files are written.
+              Defaults to results/impact-assessment/ next to this script.
+              In batch mode, callers pass results/impact-assessment/<folder_name>/.
 
     Returns a one-row DataFrame with all metric columns.
     """
@@ -990,7 +995,8 @@ def run_assessment(paths_fp: Path, downsample: int = 1) -> pd.DataFrame:
     path_raster = rasterize_paths(paths_gdf, shape, transform, crs)
 
     # ── Output directory ──────────────────────────────────────────────────────
-    out_dir = Path(__file__).parent / "results/impact-assessment"
+    if out_dir is None:
+        out_dir = Path(__file__).parent / "results/impact-assessment"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Compute metrics ───────────────────────────────────────────────────────
@@ -1057,18 +1063,48 @@ def main():
     parser = argparse.ArgumentParser(
         description="Impact assessment for mine-to-port road scenarios",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Single file:  python impact_assessment.py results/least-cost-paths/experiment_00/late_stage__kribi__base__no_mask__ds1.gpkg\n"
+            "Batch folder: python impact_assessment.py experiment_00\n"
+            "              (finds all .gpkg files under results/least-cost-paths/experiment_00/\n"
+            "               and writes outputs to results/impact-assessment/experiment_00/)"
+        ),
     )
-    parser.add_argument("paths_gpkg", type=Path,
-                        help="Generated path GeoPackage (output of path-generator)")
+    parser.add_argument("input", type=Path,
+                        help=".gpkg file path, or folder name under results/least-cost-paths/")
     parser.add_argument("--downsample", type=int, default=1,
-                        help="Reference grid downsample factor (default: 1 = native ~90 m). "
-                             "Increase to reduce memory usage.")
+                        help="Reference grid downsample factor (default: 1 = native ~90 m).")
     args = parser.parse_args()
 
-    if not args.paths_gpkg.exists():
-        sys.exit(f"Error: '{args.paths_gpkg}' not found.")
+    _model_dir  = Path(__file__).parent
+    _paths_root = _model_dir / "results/least-cost-paths"
+    _out_root   = _model_dir / "results/impact-assessment"
 
-    run_assessment(args.paths_gpkg, downsample=args.downsample)
+    inp = args.input
+
+    if inp.suffix == ".gpkg":
+        # ── Single-file mode (original behaviour) ────────────────────────────
+        if not inp.exists():
+            sys.exit(f"Error: '{inp}' not found.")
+        run_assessment(inp, downsample=args.downsample)
+    else:
+        # ── Batch-folder mode ────────────────────────────────────────────────
+        # Accept both a bare folder name ("experiment_00") and a full path.
+        folder_name = inp.name if inp.is_absolute() or inp.parent != Path(".") else str(inp)
+        paths_dir   = _paths_root / folder_name
+        if not paths_dir.exists():
+            sys.exit(f"Error: folder '{paths_dir}' not found.")
+        gpkg_files = sorted(paths_dir.glob("*.gpkg"))
+        if not gpkg_files:
+            sys.exit(f"Error: no .gpkg files found in '{paths_dir}'.")
+        out_dir = _out_root / folder_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Batch mode: {len(gpkg_files)} scenario(s) in '{folder_name}' → {out_dir}")
+        for i, gpkg_fp in enumerate(gpkg_files, 1):
+            print(f"\n{'━'*62}")
+            print(f"  [{i}/{len(gpkg_files)}] {gpkg_fp.name}")
+            print(f"{'━'*62}")
+            run_assessment(gpkg_fp, downsample=args.downsample, out_dir=out_dir)
 
 
 if __name__ == "__main__":
