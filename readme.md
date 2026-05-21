@@ -1,6 +1,6 @@
 # Impact Assessment Model for Mine-Access Road Planning in Cameroon
 
-This model evaluates the environmental and economic impact of road network scenarios that connect mining sites to export ports in Cameroon. For each scenario, it estimates construction cost, deforestation risk, and forest fragmentation caused by upgrading existing unpaved roads and constructing new roads through undeveloped land.
+Evaluates road network scenarios connecting mining sites to export ports in Cameroon across three impact dimensions: construction cost, deforestation risk, and forest fragmentation.
 
 ---
 
@@ -8,174 +8,136 @@ This model evaluates the environmental and economic impact of road network scena
 
 ![Model structure](figures/model-structure.png)
 
-The model runs in two stages:
+**Stage 1 — Least-cost path generation** (`model/path-generator.py`)
 
-**Stage 1 — Least-cost path generation** (`model/path-generator.py`): For each combination of mining scenario, port, and friction layer, the model finds the optimal (least-cost) route from each mine to its nearest port using a cost-surface algorithm. Routes follow existing roads where possible and cut new paths only when necessary. Results are saved as GeoPackages containing the path geometries and mine attributes.
+Finds the optimal route from each mine to its nearest port using a cost-surface algorithm (`MCP_Geometric`). Routes follow existing roads where possible and cut new paths only when necessary. Output: GeoPackages in `model/results/least-cost-paths/`.
 
-**Stage 2 — Impact assessment** (`model/impact-assessment.py`): For each generated path network, the model classifies every road segment by the action needed (paved — no action, upgrade, or new build), then computes three impact metrics: construction cost, deforestation risk within buffer zones, and forest fragmentation. Results are saved as a CSV (one row per scenario) alongside geospatial files for visualisation in QGIS.
+**Stage 2 — Impact assessment** (`model/impact-assessment.py`)
+
+Classifies every path pixel as paved / upgrade / new-build, then computes construction cost, deforestation risk, and forest fragmentation. Output: CSV + geospatial files in `model/results/impact-assessment/`.
 
 ---
 
-## Data and Preprocessing
+## Inputs
 
-Run the following scripts once before the model, in this order:
+### Data preparation (run once, in order)
 
-| Order | Script | What it does |
+| Step | Script | Output |
 |---|---|---|
-| 1 | `notebook/00_get-DEM.ipynb` | Downloads SRTM digital elevation model tiles for Cameroon |
-| 2 | `notebook/00_get-OSM.ipynb` | Downloads road network from OpenStreetMap / HeiGIT / Liu et al. |
-| 3 | `notebook/01_clean-roads.ipynb` | Cleans and merges road datasets into a single GeoPackage |
-| 4 | `notebook/02a_model-construction-cost-friction.py` | Builds the construction cost friction raster from slope using an earthwork volume model |
-| 5 | `notebook/02b_merge-friction-tiles.py` | Merges and clips friction tiles to the Cameroon boundary |
-| 6 | `notebook/01b_clean-hansen-forests.py` | Processes Hansen Global Forest Change tiles (2000–2024) into a single 30 m canopy cover raster for Cameroon |
+| 1 | `notebook/00_get-DEM.ipynb` | SRTM 90 m DEM tiles |
+| 2 | `notebook/00_get-OSM.ipynb` | Road network (OSM, HeiGIT, Liu 2025) |
+| 3 | `notebook/01_clean-roads.ipynb` | Merged road GeoPackage (`paved` / `unpaved`) |
+| 4 | `notebook/02a_model-construction-cost-friction.py` | Per-tile cost rasters (USD/pixel) |
+| 5 | `notebook/02b_merge-friction-tiles.py` | Merged friction raster (90 m, Cameroon extent) |
+| 6 | `notebook/01a_clean-jrc-forests.py` | JRC 2020 forest mask (30 m) |
+| 7 | `notebook/01b_clean-hansen-forests.py` | `cameroon_treecover2024_30m.tif` |
 
----
+### Input datasets (`data/input/`)
 
-## Running the Model
+| Dataset | Source | Used for |
+|---|---|---|
+| Mine locations (operational) | Ahmed et al. Sub-Saharan Africa mine DB | Origin points |
+| Mine locations (planned) | GFW Mining Permits | Early-stage scenario |
+| Port coordinates | Hardcoded (Kribi, Douala) | Destination points |
+| Road network | OSM / HeiGIT (2024) / Liu et al. (2025) | Upgrade vs. new-build classification |
+| SRTM DEM (90 m) | NASA/USGS | Slope → construction cost |
+| ESA WorldCover 2021 (10 m) | ESA | Land cover → base cost per km |
+| Construction cost parameters | Literature (EWV model) | Cost lookup tables |
+| Hansen Global Forest Change v1.12 | Hansen et al. (2013) | Treecover 2000 + loss 2001–2024 |
+| JRC Global Forest Cover 2020 v3 | JRC | Cross-check forest mask |
+| WDPA Protected Areas (Mar 2026) | UNEP-WCMC / IUCN | Spatial mask option |
+| Biodiversity Intactness Index | NHM / PREDICTS | Available; not used in current metrics |
+| Intact Forest Landscapes v2025 | IFL | Available; not used in current metrics |
+| Cameroon admin boundary | HDX | Clipping extent |
 
-All commands are run from `strategic-road-planning/model/`:
-
-```bash
-# Run all scenario combinations
-python path-generator-run.py
-
-# Preview scenarios without running
-python path-generator-run.py --dry-run
-
-# Run impact assessment for one scenario
-python impact-assessment.py results/least-cost-paths/<scenario>.gpkg
-```
-
-**Scenario naming convention:**
-
-```
-{mining_scope}__{port}__{friction}__{mask}__ds{downsample}
-Example: late_stage__kribi__base__protected_areas__ds1
-```
+### Scenario dimensions
 
 | Dimension | Options |
 |---|---|
-| Mining scope | `late_stage` (operational mines only), `late_and_early_stage` (all planned mines) |
+| Mining scope | `late_stage`, `late_and_early_stage` |
 | Port | `kribi`, `kribi_douala` |
-| Friction | `base` (slope-based construction cost raster) |
-| Mask | `no_mask`, `protected_areas` (routes avoid WDPA protected areas) |
-| Downsample | `ds1` (native ~90 m resolution), `ds5`, `ds10` |
+| Friction | `base` |
+| Mask | `no_mask`, `protected_areas` |
+| Downsample | `ds1` (~90 m), `ds5`, `ds10` |
+
+Scenario name format: `{mining_scope}__{port}__{friction}__{mask}__ds{n}`
 
 ---
 
-## Model Output
+## Outputs
 
-Each scenario produces **24 output files** saved in `model/results/impact-assessment/`.
+Each scenario produces 21 files in `model/results/impact-assessment/`.
 
----
+### `assessment_{scenario}.csv`
 
-### CSV — `assessment_{scenario}.csv`
+One row per scenario.
 
-One row per scenario containing all impact metrics.
-
-#### Road Network Classification
+**Road classification**
 
 | Column | Unit | Description |
 |---|---|---|
-| `scenario` | — | Scenario identifier |
-| `paved_km` | km | Path length along existing paved roads — no construction needed |
-| `unpaved_km` | km | Path length along existing unpaved roads to be upgraded to paved |
-| `to_be_built_km` | km | Path length requiring entirely new road construction |
-| `total_km` | km | Total mine-to-port path length across all mines in the scenario |
+| `paved_km` | km | Along existing paved roads — no action |
+| `unpaved_km` | km | Existing unpaved roads to be upgraded |
+| `to_be_built_km` | km | New road construction required |
+| `total_km` | km | Total path length across all mines |
 
-#### Construction Cost
-
-Cost is estimated by summing friction raster values (USD/km) along each road segment. The friction raster encodes construction difficulty based on terrain slope using an earthwork volume (EWV) model.
+**Construction cost**
 
 | Column | Unit | Description |
 |---|---|---|
-| `upgrade_cost_usd` | USD | Estimated cost to upgrade unpaved roads to paved standard |
-| `new_build_cost_usd` | USD | Estimated cost to construct entirely new road segments |
-| `total_cost_usd` | USD | `upgrade_cost_usd + new_build_cost_usd` |
+| `upgrade_cost_usd` | USD | Cost to upgrade unpaved → paved |
+| `new_build_cost_usd` | USD | Cost to construct new segments |
+| `total_cost_usd` | USD | `upgrade + new_build` |
 
-#### Deforestation Risk
-
-Inspired by Sonter et al. (2017) and Siqueira-Gay et al. (2022), who quantify forest loss within road buffer zones. Forest area is **canopy-cover weighted** using Hansen et al. (2013) treecover data adjusted for loss through 2024 — a pixel with 60% canopy cover contributes 0.6 × pixel area rather than a full pixel. Forest is defined as ≥10% canopy cover (FAO definition). Buffer zones are computed via Euclidean distance transform at 90 m, upsampled to 30 m for counting. Upgrade and build zones are mutually exclusive — build takes priority where they overlap.
+**Deforestation risk** — canopy-cover weighted (Hansen, ≥10% = forest); upgrade and build zones are mutually exclusive (build takes priority)
 
 | Column | Unit | Description |
 |---|---|---|
-| `defor_upgrade_0m_ha` | ha | Canopy-weighted forest area on the direct footprint of upgrade roads |
-| `defor_build_0m_ha` | ha | Canopy-weighted forest area on the direct footprint of new-build roads |
-| `defor_action_0m_ha` | ha | Combined footprint: `defor_upgrade_0m_ha + defor_build_0m_ha` |
-| `defor_upgrade_{d}m_ha` | ha | Forest area within distance *d* of upgrade roads (d = 100, 250, 500, 750, 1000 m) |
-| `defor_build_{d}m_ha` | ha | Forest area within distance *d* of new-build roads |
-| `defor_action_{d}m_ha` | ha | Combined: `defor_upgrade_{d}m_ha + defor_build_{d}m_ha` |
+| `defor_upgrade_0km_km2` | km² | Forest on direct footprint of upgrade roads |
+| `defor_build_0km_km2` | km² | Forest on direct footprint of new-build roads |
+| `defor_action_0km_km2` | km² | Combined footprint |
+| `defor_upgrade_{d}km_km2` | km² | Forest within *d* km of upgrade roads; *d* ∈ {0.1, 0.25, 0.5, 0.75, 1.0} |
+| `defor_build_{d}km_km2` | km² | Forest within *d* km of new-build roads |
+| `defor_action_{d}km_km2` | km² | Combined |
 
-#### Forest Fragmentation
-
-Following Siqueira-Gay et al. (2022): **Fragmentation index = (patches − 1) / (forest extent in km² − 1)**. Forest patches are identified using 8-connectivity with a minimum patch size of ≥1 ha to exclude sub-pixel noise. The **before** state burns the full existing road network (paved + unpaved) into the forest mask; the **after** state additionally burns the scenario's action roads. Computed across all non-overlapping grid windows covering Cameroon. Reported at four window sizes as a sensitivity test.
+**Forest fragmentation** — index = (patches − 1) / (forest km² − 1); min patch 1 ha; *w* ∈ {50, 100} km
 
 | Column | Unit | Description |
 |---|---|---|
-| `fragmentation_patches_before_{w}km` | count | Total forest patches (≥1 ha) across all windows with the existing road network burned |
-| `fragmentation_patches_after_{w}km` | count | Same but with scenario action roads additionally burned |
-| `fragmentation_index_before_{w}km` | patches / km² | Country-level index before: `(patches_before − 1) / (forest_km² − 1)` |
-| `fragmentation_index_after_{w}km` | patches / km² | Country-level index after adding scenario roads |
-| `fragmentation_n_windows_with_action_roads_{w}km` | count | Number of grid cells that contained at least one action road pixel |
+| `fragmentation_patches_before_{w}km` | count | Patch count, existing roads burned |
+| `fragmentation_patches_after_{w}km` | count | Patch count, scenario roads also burned |
+| `fragmentation_index_before_{w}km` | patches/km² | Index before |
+| `fragmentation_index_after_{w}km` | patches/km² | Index after |
+| `fragmentation_n_windows_with_action_roads_{w}km` | count | Grid cells containing action roads |
 
-*w* ∈ {10, 50, 100, 150} km
+### `action_roads_{scenario}.gpkg`
 
----
-
-### Geospatial Outputs
-
-#### Action Roads — `action_roads_{scenario}.gpkg`
-
-A vector line file of all upgrade and new-build road segments, split by road class. Use this in QGIS to inspect individual segment costs or to style roads by action type.
+Vector lines of upgrade and new-build segments.
 
 | Attribute | Description |
 |---|---|
-| `mine_id` | Mine identifier |
-| `mine_name` | Mine name |
-| `closest_port` | Port this segment connects to |
+| `mine_id`, `mine_name` | Mine identifier |
+| `closest_port` | Destination port |
 | `action_needed` | `upgrade` or `build` |
-| `length_km` | Segment length (km) |
-| `construction_cost_usd` | Estimated construction cost for this segment |
-| `scenario` | Scenario identifier |
+| `length_km` | Segment length |
+| `construction_cost_usd` | Segment-level cost (spatial inspection only; use CSV for totals) |
 
-Note: segment-level costs are for spatial inspection only. Use the CSV for scenario-level cost totals, which correctly deduplicate shared corridors used by multiple mines.
+### `classified_{scenario}.tif`
 
-#### Classified Road Raster — `classified_{scenario}.tif`
+90 m raster: `0` = not a path pixel · `1` = paved · `2` = upgrade · `3` = new build
 
-A 90 m raster encoding road classification for every pixel along the mine-to-port paths.
+### `defor_buffer_{d}km_{scenario}.tif`
 
-| Value | Meaning |
-|---|---|
-| 0 | Not a path pixel |
-| 1 | Existing paved road (no action needed) |
-| 2 | Existing unpaved road to be upgraded |
-| 3 | New road to be built |
+30 m raster (6 files, one per buffer distance): `0` = outside · `2` = upgrade buffer · `3` = build buffer
 
-#### Deforestation Buffer Rasters — `defor_buffer_{d}m_{scenario}.tif`
+### `fragmentation_{type}_{w}km_{scenario}.tif`
 
-Six rasters (one per buffer distance: 0, 100, 250, 500, 750, 1000 m) at 30 m resolution. Each pixel inside the buffer zone is labelled by the road action type that created it. Useful for overlaying with other spatial data (biodiversity index, protected areas) in QGIS.
-
-| Value | Meaning |
-|---|---|
-| 0 | Outside the buffer |
-| 2 | Within buffer of an upgrade road |
-| 3 | Within buffer of a new-build road |
-
-#### Fragmentation Rasters — `fragmentation_{type}_{w}km_{scenario}.tif`
-
-Sixteen rasters (4 window sizes × 4 types). Each pixel represents one grid window — the raster resolution is therefore coarser for larger window sizes. Subtract `index_before` from `index_after` in QGIS or a notebook to map where fragmentation increases the most.
-
-| File | Format | Description |
-|---|---|---|
-| `fragmentation_patches_before_{w}km_{scenario}.tif` | int32 | Forest patch count per window cell, before; nodata = −1 (no forest) |
-| `fragmentation_patches_after_{w}km_{scenario}.tif` | int32 | Forest patch count per window cell, after |
-| `fragmentation_index_before_{w}km_{scenario}.tif` | float32 | Fragmentation index (patches/km²) per window cell, before; nodata = NaN |
-| `fragmentation_index_after_{w}km_{scenario}.tif` | float32 | Fragmentation index (patches/km²) per window cell, after |
+12 rasters (2 window sizes × 6 types): `patches_before`, `patches_after`, `patches_delta`, `index_before`, `index_after`, `index_delta`. Nodata = −1 (int) or NaN (float) where no forest exists.
 
 ---
 
 ## References
 
-- Hansen, M. C. et al. (2013). High-resolution global maps of 21st-century forest cover change. *Science*, 342, 850–853.
-- Siqueira-Gay, J. et al. (2022). Strategic planning to mitigate mining impacts on protected areas in the Brazilian Amazon. *Nature Sustainability*, 5, 853–860.
-- Sonter, L. J. et al. (2017). Mining drives extensive deforestation in the Brazilian Amazon. *Nature Communications*, 8, 1013.
+- Hansen et al. (2013). *Science*, 342, 850–853.
+- Siqueira-Gay et al. (2022). *Nature Sustainability*, 5, 853–860.
+- Sonter et al. (2017). *Nature Communications*, 8, 1013.
