@@ -91,8 +91,8 @@ python impact_assessment.py results/least-cost-paths/experiment_00/late_stage__k
 
 | Dataset | Source | Used for |
 |---|---|---|
-| Mine locations (operational) | Ahmed et al. Sub-Saharan Africa mine DB | Origin points |
-| Mine locations (planned) | GFW Mining Permits | Early-stage scenario |
+| Mine locations (operational) | Ahmed et al. | Built mine footprint |
+| Mine locations (planned) | S&P | Planned mine locations |
 | Port coordinates | Hardcoded (Kribi, Douala) | Destination points |
 | Road network | OSM / HeiGIT (2024) / Liu et al. (2025) | Upgrade vs. new-build classification |
 | SRTM DEM (90 m) | NASA/USGS | Slope → construction cost |
