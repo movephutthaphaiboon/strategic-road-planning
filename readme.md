@@ -200,9 +200,9 @@ Patch-ID raster and admin2 fragmentation statistics for the action scenario.
 
 ---
 
-## References
+<!-- ## References
 
 - Damania et al. (2018). *World Bank Research Report.*
 - Hansen et al. (2013). *Science*, 342, 850–853.
 - Siqueira-Gay et al. (2022). *Nature Sustainability*, 5, 853–860.
-- Sonter et al. (2017). *Nature Communications*, 8, 1013.
+- Sonter et al. (2017). *Nature Communications*, 8, 1013. -->
