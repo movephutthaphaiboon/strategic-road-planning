@@ -12,20 +12,13 @@ Usage:
 """
 
 import argparse
-import importlib.util
 import itertools
 from pathlib import Path
 
 import pandas as pd
 
-# Load path-generator.py by file path (hyphens are not valid in module names)
-_spec = importlib.util.spec_from_file_location(
-    "path_generator", Path(__file__).parent / "path-generator.py"
-)
-_pg = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_pg)
-ExperimentConfig = _pg.ExperimentConfig
-run_experiment   = _pg.run_experiment
+import path_generator
+from path_generator import ExperimentConfig, run_experiment
 
 # =============================================================================
 # BASE PATHS
