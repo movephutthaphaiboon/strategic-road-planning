@@ -30,6 +30,8 @@ _DEFAULT_ROADS = _REPO_ROOT / "data/output/processed_roads_official/cleaned_merg
 _DEFAULT_OUTPUT_DIR = _REPO_ROOT / "data/output/forest-patch-detection"
 _ADMIN_DIR = _REPO_ROOT / "data/input/cmr_admin_boundaries_humdata"
 
+_CAMEROON_BOUNDARY = _ADMIN_DIR / "cmr_admin0_em.shp"
+
 _ADMIN_NAME_COL = {0: "adm0_name", 1: "adm1_name", 2: "adm2_name1", 3: "adm3_name1"}
 _STRUCT_8 = np.ones((3, 3), dtype=int)  # 8-connectivity
 
@@ -49,6 +51,7 @@ class PatchConfig:
     burn_paved_roads: bool = False      # treat paved roads as non-forest barriers
     burn_unpaved_roads: bool = False    # treat unpaved roads as non-forest barriers
     road_path: Path = field(default_factory=lambda: _DEFAULT_ROADS)
+    extra_burn_gpkg: Path | None = None  # additional roads to burn (all geometries, no surface filter)
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +125,18 @@ def _burn_roads(forest: np.ndarray, valid: np.ndarray,
     n_burned = int(road_mask.sum())
     print(f"  Burned {n_burned:,} road pixels ({n_burned * _compute_pixel_area_ha(transform):.0f} ha)")
     return forest & ~road_mask, valid & ~road_mask
+
+
+def _clip_to_cameroon(labeled: np.ndarray, transform: Affine, crs) -> np.ndarray:
+    """Zero out patch IDs outside the Cameroon national boundary."""
+    boundary = gpd.read_file(_CAMEROON_BOUNDARY)
+    if boundary.crs != crs:
+        boundary = boundary.to_crs(crs)
+    outside = geometry_mask(boundary.geometry, transform=transform,
+                            invert=False, out_shape=labeled.shape)
+    labeled = labeled.copy()
+    labeled[outside] = 0
+    return labeled
 
 
 def _label_patches(forest: np.ndarray, min_patch_px: int) -> np.ndarray:
@@ -250,9 +265,30 @@ def run_patch_detection(config: PatchConfig) -> tuple:
         forest, valid = _burn_roads(forest, valid, transform, crs, config.road_path, road_types)
         print(f"  Forest cover after roads: {100 * forest.sum() / valid.sum():.1f}% of valid area")
 
+    if config.extra_burn_gpkg is not None and config.extra_burn_gpkg.exists():
+        print(f"Burning extra roads: {config.extra_burn_gpkg.name} …")
+        extra = gpd.read_file(config.extra_burn_gpkg)
+        if extra.crs != crs:
+            extra = extra.to_crs(crs)
+        extra_geoms = [g for g in extra.geometry if g is not None]
+        if extra_geoms:
+            extra_raster = rasterize(
+                [(g, 1) for g in extra_geoms],
+                out_shape=forest.shape, transform=transform,
+                fill=0, dtype=np.uint8, all_touched=True,
+            )
+            extra_mask = extra_raster == 1
+            n_burned = int(extra_mask.sum())
+            print(f"  Burned {n_burned:,} extra road pixels "
+                  f"({n_burned * _compute_pixel_area_ha(transform):.0f} ha)")
+            forest = forest & ~extra_mask
+            valid  = valid  & ~extra_mask
+
     print("Labeling country-level forest patches …")
     labeled = _label_patches(forest, min_patch_px)
     print(f"  {int(labeled.max())} patches after filtering < {config.min_patch_size_ha} ha")
+    print("Clipping patch raster to Cameroon boundary …")
+    labeled = _clip_to_cameroon(labeled, transform, crs)
     _save_patch_raster(labeled, transform, crs, tif_out)
 
     admin_path = _ADMIN_DIR / f"cmr_admin{config.admin_level}.shp"
