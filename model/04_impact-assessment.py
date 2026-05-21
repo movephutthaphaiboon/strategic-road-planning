@@ -64,12 +64,14 @@ DAMANIA_CURVE       = "good"   # road quality curve: "good", "fair", "poor", "ve
 DAMANIA_MAX_DIST_KM = 10.0     # maximum distance to apply the clearing decay (km)
 SAVE_DEFOR_TIFS     = True     # save loss-pct and remaining-treecover rasters (float32, 0–100 scale)
 
-# --- Fragmentation settings --------------------------------------------------
-FRAGMENTATION_WINDOW_KM      = [100]       # window size in km
-FRAGMENTATION_MIN_PATCH_KM2  = [0.5, 1.0, 10.0] # sensitivity thresholds: 50 ha, 100 ha, 1,000 ha
-
-# --- Forest definition -------------------------------------------------------
-FOREST_THRESHOLD = 10   # minimum canopy cover (%) — FAO definition
+# --- Fragmentation settings (forest_patch_detection) -------------------------
+FRAGMENTATION_MIN_PATCH_HA = 1.0    # minimum patch size counted (ha)
+FOREST_THRESHOLD           = 10     # minimum canopy cover (%) — FAO definition
+BASELINE_FRAG_GPKG = (
+    Path(__file__).parent.parent
+    / "data/output/forest-patch-detection"
+    / "no_action__forest_patches__thresh10__minpatch1ha__adm2__roads_paved.gpkg"
+)
 
 # =============================================================================
 # PATHS
@@ -419,7 +421,7 @@ def save_classified_lines(paths_gdf: gpd.GeoDataFrame,
         return
 
     out_gdf = gpd.GeoDataFrame(records, crs=crs)
-    out_fp = out_dir / f"action_roads_{scenario_stem}.gpkg"
+    out_fp = out_dir / f"{scenario_stem}__action_roads.gpkg"
     out_gdf.to_file(out_fp, driver="GPKG")
     print(f"  Action roads → {out_fp}  ({len(out_gdf)} segments)")
 
@@ -588,13 +590,17 @@ def metric_deforestation(classified_raster_fp: Path,
             dst_transform=cls_sub_transform, dst_crs=cls_crs,
             resampling=WarpResampling.average,
         )
-    tc_90 = np.clip(tc_90, 0, 100)   # mask nodata (255) and water (200) codes
+    # Values > 100 are water (Hansen code 200) or nodata (255) — zero out for
+    # calculation (no canopy contribution) but remember the mask so the saved
+    # TIFs use NaN for those pixels (prevents overlay from inflating forest area)
+    tc_90_valid = tc_90 <= 100
+    tc_90 = np.where(tc_90_valid, tc_90, 0.0).astype(np.float32)
 
     # Pixel area at 90 m
-    px_area_km2 = cls_px_m_x * cls_px_m_y / 1_000_000
+    px_area_ha  = cls_px_m_x * cls_px_m_y / 10_000
     canopy_frac = tc_90 / 100.0
     print(f"  Total canopy-weighted forest area in subregion: "
-          f"{float(canopy_frac.sum() * px_area_km2):,.2f} km²")
+          f"{float(canopy_frac.sum() * px_area_ha):,.0f} ha")
 
     # ── Distance transforms at 90 m (small array) ─────────────────────────────
     # Scipy distance_transform_edt allocates float64 internally — running on the
@@ -631,14 +637,14 @@ def metric_deforestation(classified_raster_fp: Path,
     pct_build   = np.where(dist_upgrade_km <= dist_build_km, 0.0, pct_build).astype(np.float32)
 
     # Expected cleared forest per pixel = canopy_frac × pct_cleared × px_area_km2
-    cleared_upgrade = canopy_frac * pct_upgrade * px_area_km2
-    cleared_build   = canopy_frac * pct_build   * px_area_km2
+    cleared_upgrade = canopy_frac * pct_upgrade * px_area_ha
+    cleared_build   = canopy_frac * pct_build   * px_area_ha
     cleared_action  = cleared_upgrade + cleared_build
 
     results = {
-        "defor_upgrade_km2": round(float(cleared_upgrade.sum()), 4),
-        "defor_build_km2":   round(float(cleared_build.sum()),   4),
-        "defor_action_km2":  round(float(cleared_action.sum()),  4),
+        "defor_upgrade_ha": round(float(cleared_upgrade.sum()), 2),
+        "defor_build_ha":   round(float(cleared_build.sum()),   2),
+        "defor_action_ha":  round(float(cleared_action.sum()),  2),
     }
 
     if SAVE_DEFOR_TIFS:
@@ -649,39 +655,88 @@ def metric_deforestation(classified_raster_fp: Path,
         # Combined clearing probability per pixel (upgrade and build are mutually exclusive)
         pct_cleared_90 = (pct_upgrade + pct_build).astype(np.float32)
 
-        # Canopy cover lost (same 0–100 scale as Hansen treecover — subtractable directly)
-        loss_pct_90      = (tc_90 * pct_cleared_90).astype(np.float32)
+        # loss_pct: subregion only (NaN for water/nodata), same grid as cls_sub
+        _nan32 = np.float32("nan")
+        loss_pct_90 = np.where(tc_90_valid, tc_90 * pct_cleared_90, _nan32).astype(np.float32)
+        with rasterio.open(out_dir / f"{stem}__defor_loss_pct.tif", "w",
+                           driver="GTiff", dtype="float32", nodata=float("nan"),
+                           width=cls_sub.shape[1], height=cls_sub.shape[0], count=1,
+                           crs=cls_crs, transform=cls_sub_transform, compress="lzw") as dst:
+            dst.write(loss_pct_90, 1)
+        print(f"  Saved → {stem}__defor_loss_pct.tif")
 
-        # Remaining treecover after road-induced clearing
-        remaining_90     = (tc_90 * (1.0 - pct_cleared_90)).astype(np.float32)
+        # remaining_treecover: full-country 90 m (treecover's own grid) so that
+        # metric_forest_fragmentation can pass it directly to run_patch_detection
+        # without any reprojection or overlay step.
+        TARGET_M = 90.0
+        with rasterio.open(TREECOVER_FP) as tc_src:
+            px_m_fc = abs(tc_src.transform.a) * 111_320
+            fc_scale = max(1, round(TARGET_M / px_m_fc))
+            fc_h = tc_src.height // fc_scale
+            fc_w = tc_src.width  // fc_scale
+            tc_raw_fc = tc_src.read(1, out_shape=(fc_h, fc_w), resampling=Resampling.average)
+            tc_fc_transform = tc_src.transform * Affine.scale(fc_scale, fc_scale)
+            tc_fc_crs = tc_src.crs
 
-        defor_profile = {
-            "driver": "GTiff", "dtype": "float32", "nodata": float("nan"),
-            "width": cls_sub.shape[1], "height": cls_sub.shape[0], "count": 1,
-            "crs": cls_crs, "transform": cls_sub_transform, "compress": "lzw",
-        }
-        for fname, arr in [
-            (f"defor_loss_pct_{stem}.tif",             loss_pct_90),
-            (f"defor_remaining_treecover_{stem}.tif",  remaining_90),
-        ]:
-            with rasterio.open(out_dir / fname, "w", **defor_profile) as dst:
-                dst.write(arr, 1)
-            print(f"  Saved → {fname}")
+        tc_valid_fc = tc_raw_fc <= 100   # water (200) and nodata (255) → invalid
+        tc_90_fc    = np.where(tc_valid_fc, tc_raw_fc.astype(np.float32), 0.0)
+
+        # Reproject pct_cleared from cls_sub grid onto the full-country 90 m grid
+        pct_cleared_fc = np.zeros((fc_h, fc_w), dtype=np.float32)
+        warp_reproject(
+            source=pct_cleared_90, destination=pct_cleared_fc,
+            src_transform=cls_sub_transform, src_crs=cls_crs,
+            dst_transform=tc_fc_transform, dst_crs=tc_fc_crs,
+            resampling=WarpResampling.bilinear,
+        )
+        pct_cleared_fc = np.clip(pct_cleared_fc, 0.0, 1.0)
+
+        remaining_fc = np.where(tc_valid_fc,
+                                tc_90_fc * (1.0 - pct_cleared_fc),
+                                _nan32).astype(np.float32)
+        with rasterio.open(out_dir / f"{stem}__defor_remaining_treecover.tif", "w",
+                           driver="GTiff", dtype="float32", nodata=float("nan"),
+                           width=fc_w, height=fc_h, count=1,
+                           crs=tc_fc_crs, transform=tc_fc_transform, compress="lzw") as dst:
+            dst.write(remaining_fc, 1)
+        print(f"  Saved → {stem}__defor_remaining_treecover.tif  "
+              f"({fc_h}×{fc_w} px, full country)")
+
+        # Total remaining forest: Σ pixels [remaining_pct / 100 × px_area_ha]
+        # Clip to Cameroon boundary so pixels in neighbouring countries are excluded.
+        import math
+        from rasterio.features import geometry_mask as _geometry_mask
+        _cmr_adm0 = BASE_DIR / "data/input/cmr_admin_boundaries_humdata/cmr_admin0_em.shp"
+        _cmr_gdf  = gpd.read_file(_cmr_adm0)
+        if _cmr_gdf.crs.to_epsg() != 4326:
+            _cmr_gdf = _cmr_gdf.to_crs("EPSG:4326")
+        _outside_cmr = _geometry_mask(
+            [g.__geo_interface__ for g in _cmr_gdf.geometry],
+            transform=tc_fc_transform, invert=False, out_shape=(fc_h, fc_w),
+        )
+        remaining_fc_cmr = np.where(_outside_cmr, np.nan, remaining_fc)
+
+        center_lat_fc  = tc_fc_transform.f + (fc_h / 2) * tc_fc_transform.e
+        px_m_x_fc      = abs(tc_fc_transform.a) * 111_320 * math.cos(math.radians(center_lat_fc))
+        px_m_y_fc      = abs(tc_fc_transform.e) * 111_320
+        px_area_ha_fc  = px_m_x_fc * px_m_y_fc / 10_000
+        total_remaining_forest_ha = float(np.nansum(remaining_fc_cmr)) / 100.0 * px_area_ha_fc
+        results["total_remaining_forest_ha"] = round(total_remaining_forest_ha, 2)
 
     return results
 
 
 def print_deforestation(result: dict):
-    up  = result.get("defor_upgrade_km2", 0)
-    bld = result.get("defor_build_km2",   0)
-    act = result.get("defor_action_km2",  0)
+    up  = result.get("defor_upgrade_ha", 0)
+    bld = result.get("defor_build_ha",   0)
+    act = result.get("defor_action_ha",  0)
     print(f"\n  Deforestation risk — expected forest cleared (Damania et al. 2018, {DAMANIA_CURVE} road, 0–{DAMANIA_MAX_DIST_KM:.0f} km decay):")
     print(f"  {'─'*58}")
-    print(f"  {'':>12}  {'Upgrade (km²)':>15}  {'New build (km²)':>15}  {'Combined (km²)':>15}")
+    print(f"  {'':>12}  {'Upgrade (ha)':>14}  {'New build (ha)':>14}  {'Combined (ha)':>14}")
     print(f"  {'─'*58}")
-    print(f"  {'Expected':>12}  {up:>15,.3f}  {bld:>15,.3f}  {act:>15,.3f}")
+    print(f"  {'Expected':>12}  {up:>14,.1f}  {bld:>14,.1f}  {act:>14,.1f}")
     print(f"  {'─'*58}")
-    print(f"  Formula: Σ_pixels [ canopy_frac × pct_cleared(distance) × pixel_area_km² ]")
+    print(f"  Formula: Σ_pixels [ canopy_frac × pct_cleared(distance) × pixel_area_ha ]")
 
 
 # def metric_mining_capacity(paths_gdf, mines_gdf) -> dict:
@@ -690,345 +745,214 @@ def print_deforestation(result: dict):
 
 
 # =============================================================================
-# METRIC 4 — Forest fragmentation
+# METRIC 4 — Forest fragmentation (via forest_patch_detection)
 # =============================================================================
 
-def metric_forest_fragmentation(classified_raster_fp: Path,
-                                 road_raster: np.ndarray,
-                                 window_km: float = 100.0,
-                                 min_patch_km2: float = 1.0,
-                                 out_dir: Path | None = None,
-                                 scenario_stem: str = "") -> dict:
+# Patch size bins — (column_key, condition on patch_ha array)
+_PSD_BINS = [
+    ("gt1000kha",    lambda h: h > 1_000_000),
+    ("100k_1000kha", lambda h: (h >= 100_000) & (h <= 1_000_000)),
+    ("10k_100kha",   lambda h: (h >= 10_000)  & (h <  100_000)),
+    ("1k_10kha",     lambda h: (h >= 1_000)   & (h <  10_000)),
+    ("100_1kha",     lambda h: (h >= 100)      & (h <  1_000)),
+    ("10_100ha",     lambda h: (h >= 10)       & (h <  100)),
+    ("1_10ha",       lambda h: (h >= 1)        & (h <  10)),
+    ("lt1ha",        lambda h:  h < 1),
+]
+
+_PSD_LABELS = {
+    "gt1000kha":    "> 1,000,000 ha",
+    "100k_1000kha": "100,000–1,000,000 ha",
+    "10k_100kha":   "10,000–100,000 ha",
+    "1k_10kha":     "1,000–10,000 ha",
+    "100_1kha":     "100–1,000 ha",
+    "10_100ha":     "10–100 ha",
+    "1_10ha":       "1–10 ha",
+    "lt1ha":        "< 1 ha",
+}
+
+
+def _patch_size_distribution(tif_path: Path) -> dict:
+    """Compute patch size distribution from a patch-ID raster (uint32, 0=background).
+
+    Returns flat dict with keys psd_{bin}_n (count) and psd_{bin}_ha (total area).
     """
-    Estimate the increase in number of forest patches caused by action roads.
+    with rasterio.open(tif_path) as src:
+        arr  = src.read(1)
+        tf   = src.transform
+        lat_c   = tf.f + (src.height / 2) * tf.e
+        pix_w   = abs(tf.a) * 111_320 * np.cos(np.radians(lat_c))
+        pix_h   = abs(tf.e) * 111_320
+        pixel_ha = (pix_w * pix_h) / 10_000
 
-    Approach: sliding non-overlapping windows across the treecover raster.
-    For each window that contains at least one action road pixel:
-      1. Build a binary forest mask (canopy ≥ FOREST_THRESHOLD %).
-      2. Count connected forest patches BEFORE burning the roads.
-      3. Burn action road pixels (values 2 and 3) to non-forest.
-      4. Count patches AFTER.
-      5. Accumulate the difference.
+    _, px_counts = np.unique(arr[arr > 0], return_counts=True)
+    patch_ha = px_counts * pixel_ha
 
-    Non-overlapping windows avoid double-counting patches that span window
-    boundaries.  Windows with no action roads are skipped for efficiency.
+    result = {}
+    for key, condition in _PSD_BINS:
+        mask = condition(patch_ha)
+        result[f"psd_{key}_n"]  = int(mask.sum())
+        result[f"psd_{key}_ha"] = round(float(patch_ha[mask].sum()), 2)
+    return result
 
-    Returns
-    -------
-    fragmentation_new_patches      : total additional patches across all windows
-    fragmentation_windows_processed: number of windows that contained roads
+
+def metric_forest_fragmentation(scenario_stem: str,
+                                 remaining_tif: Path,
+                                 cls_sub: np.ndarray,
+                                 cls_sub_transform,
+                                 cls_crs,
+                                 out_dir: Path) -> dict:
     """
-    import math
-    from rasterio.transform import Affine
-    from scipy.ndimage import label as ndimage_label
-    from rasterio.warp import reproject as warp_reproject, Resampling as WarpResampling
-    from rasterio.windows import Window, from_bounds as window_from_bounds
+    Estimate forest fragmentation caused by action roads using run_patch_detection.
 
-    struct_8 = np.ones((3, 3), dtype=int)   # 8-connectivity for forest patches
+    remaining_tif is the full-country 90 m treecover produced by metric_deforestation
+    (same grid as the original treecover resampled to 90 m). It is passed directly to
+    run_patch_detection — no overlay or reprojection needed.
 
-    print(f"  Loading classified raster: {classified_raster_fp.name}")
-    with rasterio.open(classified_raster_fp) as cls_src:
-        cls_arr       = cls_src.read(1)
-        cls_transform = cls_src.transform
-        cls_crs       = cls_src.crs
+    Returns a dict with frag_* keys (action state, baseline, and deltas).
+    """
+    from forest_patch_detection import PatchConfig, run_patch_detection
 
-    action_mask = (cls_arr == 2) | (cls_arr == 3)
+    action_mask = (cls_sub == 2) | (cls_sub == 3)
     if not action_mask.any():
         print("  No action roads — fragmentation metric skipped.")
         return {}
 
-    # Window size in treecover pixels (~30 m)
-    with rasterio.open(TREECOVER_FP) as tc_src:
-        tc_transform = tc_src.transform
-        tc_crs       = tc_src.crs
-        tc_height    = tc_src.height
-        tc_width     = tc_src.width
+    if not BASELINE_FRAG_GPKG.exists():
+        print(f"  Warning: baseline gpkg not found: {BASELINE_FRAG_GPKG}")
+        print(f"  Run forest-patch-detection-run__base.py first.")
+        return {}
 
-    lat_c        = tc_transform.f + (tc_height / 2) * tc_transform.e
-    px_size_m    = abs(tc_transform.a) * 111_320 * math.cos(math.radians(lat_c))
-    win_px       = round(window_km * 1_000 / px_size_m)
-    px_area_km2  = (px_size_m ** 2) / 1_000_000
-    min_patch_px = max(1, round(min_patch_km2 / px_area_km2))
-    patch_label  = f"min{min_patch_km2:g}km2".replace(".", "p")
+    # Use remaining_tif (full-country, treecover's 90 m grid) if available,
+    # otherwise fall back to the original treecover (no deforestation effect).
+    if remaining_tif.exists():
+        action_treecover = remaining_tif
+        print(f"  Using full-country remaining treecover: {remaining_tif.name}")
+    else:
+        action_treecover = TREECOVER_FP
+        print(f"  Warning: {remaining_tif.name} not found — using original treecover")
 
-    print(f"  Window: {window_km:.0f} km = {win_px} × {win_px} px  |  "
-          f"forest ≥ {FOREST_THRESHOLD}%  |  min patch ≥ {min_patch_km2} km² ({min_patch_px} px)")
+    # Burn action road geometries explicitly as barriers (in addition to treecover
+    # reduction from remaining_tif) so that road pixels create hard patch boundaries
+    action_roads_gpkg = out_dir / f"{scenario_stem}__action_roads.gpkg"
+    extra_burn = action_roads_gpkg if action_roads_gpkg.exists() else None
+    if extra_burn is None:
+        print(f"  Note: {scenario_stem}__action_roads.gpkg not found — "
+              f"road barriers not burned (enable RUN_CONSTRUCTION_COST to generate it)")
 
-    n_windows              = 0
-    n_windows_action_roads = 0
-    total_patches_before   = 0   # all-roads baseline
-    total_patches_after    = 0
-    total_patches_before_pb = 0  # paved-only baseline (Etoudi et al. 2023)
-    total_patches_after_pb  = 0
-    total_dissected         = 0  # patches cut by action roads (all-roads baseline)
-    total_dissected_pb      = 0  # patches cut by action roads (paved-only baseline)
+    # Run patch detection on the action scenario treecover
+    action_cfg = PatchConfig(
+        treecover_path=action_treecover,
+        prefix=scenario_stem,
+        output_dir=out_dir,
+        forest_threshold=FOREST_THRESHOLD,
+        min_patch_size_ha=FRAGMENTATION_MIN_PATCH_HA,
+        admin_level=2,
+        burn_paved_roads=True,
+        burn_unpaved_roads=False,
+        extra_burn_gpkg=extra_burn,
+    )
+    print("\n  Running patch detection for action scenario …")
+    action_tif, action_gpkg = run_patch_detection(action_cfg)
 
-    # Output grids: one cell per window
-    grid_rows = math.ceil(tc_height / win_px)
-    grid_cols = math.ceil(tc_width  / win_px)
-    _nan = float("nan")
-    grid_index_before   = np.full((grid_rows, grid_cols), _nan, dtype=np.float32)
-    grid_index_after    = np.full((grid_rows, grid_cols), _nan, dtype=np.float32)
-    grid_patches_before = np.full((grid_rows, grid_cols), -1,   dtype=np.int32)
-    grid_patches_after  = np.full((grid_rows, grid_cols), -1,   dtype=np.int32)
-    # Paved-only baseline grids
-    grid_index_before_pb   = np.full((grid_rows, grid_cols), _nan, dtype=np.float32)
-    grid_index_after_pb    = np.full((grid_rows, grid_cols), _nan, dtype=np.float32)
-    grid_patches_before_pb = np.full((grid_rows, grid_cols), -1,   dtype=np.int32)
-    grid_patches_after_pb  = np.full((grid_rows, grid_cols), -1,   dtype=np.int32)
-    # Dissection grids
-    grid_dissection    = np.full((grid_rows, grid_cols), -1, dtype=np.int32)
-    grid_dissection_pb = np.full((grid_rows, grid_cols), -1, dtype=np.int32)
+    # 5. Aggregate country-level stats from a patch-detection GeoPackage
+    def _aggregate(gpkg_path: Path) -> dict:
+        gdf = gpd.read_file(gpkg_path)
+        total_forest_ha  = float(gdf["forest_ha"].sum())
+        total_area_ha    = float(gdf["area_ha"].sum())
+        total_n_patches  = int(gdf["n_patches"].sum())
+        total_pct_forest = round(100.0 * total_forest_ha / total_area_ha, 2) if total_area_ha > 0 else 0.0
+        w = gdf["n_patches"].values.astype(float)
+        mean_patch_ha = float(np.average(gdf["mean_patch_ha"].values, weights=w)) if w.sum() > 0 else 0.0
+        frag_index = (total_n_patches - 1) / (total_forest_ha - 1) if total_forest_ha > 1 else 0.0
+        return {
+            "forest_ha":     round(total_forest_ha, 2),
+            "pct_forest":    total_pct_forest,
+            "n_patches":     total_n_patches,
+            "mean_patch_ha": round(mean_patch_ha, 2),
+            "frag_index":    round(frag_index, 8),
+        }
 
-    with rasterio.open(TREECOVER_FP) as tc_src:
-        for row_off in range(0, tc_height, win_px):
-            for col_off in range(0, tc_width, win_px):
-                grid_r = row_off // win_px
-                grid_c = col_off // win_px
+    baseline = _aggregate(BASELINE_FRAG_GPKG)
+    action   = _aggregate(action_gpkg)
 
-                win_h = min(win_px, tc_height - row_off)
-                win_w = min(win_px, tc_width  - col_off)
-                window        = Window(col_off, row_off, win_w, win_h)
-                win_transform = tc_src.window_transform(window)
+    # Patch size distributions from TIF rasters
+    baseline_tif = BASELINE_FRAG_GPKG.with_suffix(".tif")
+    if baseline_tif.exists():
+        print("  Computing patch size distributions …")
+        baseline_psd = _patch_size_distribution(baseline_tif)
+        action_psd   = _patch_size_distribution(action_tif)
+    else:
+        print(f"  Warning: baseline TIF not found ({baseline_tif.name}) — skipping PSD")
+        baseline_psd = None
+        action_psd   = None
 
-                # Quick overlap check using the 90 m classified raster
-                w_left   = win_transform.c
-                w_top    = win_transform.f
-                w_right  = w_left + win_w * win_transform.a
-                w_bottom = w_top  + win_h * win_transform.e
+    # 6. Print comparison table
+    print(f"\n  Forest fragmentation (paved-road baseline, {FRAGMENTATION_MIN_PATCH_HA:.0f} ha min patch):")
+    print(f"  {'─'*72}")
+    print(f"  {'Metric':<26}  {'Baseline':>12}  {'Action':>12}  {'Delta':>12}")
+    print(f"  {'─'*72}")
+    for key, label in [
+        ("forest_ha",     "Forest (ha)"),
+        ("pct_forest",    "Forest (%)"),
+        ("n_patches",     "N patches"),
+        ("mean_patch_ha", "Mean patch (ha)"),
+        ("frag_index",    "Frag index"),
+    ]:
+        b, a = baseline[key], action[key]
+        d = a - b
+        if key == "n_patches":
+            print(f"  {label:<26}  {b:>12,}  {a:>12,}  {d:>+12,}")
+        elif key == "frag_index":
+            print(f"  {label:<26}  {b:>12.6f}  {a:>12.6f}  {d:>+12.6f}")
+        else:
+            print(f"  {label:<26}  {b:>12.1f}  {a:>12.1f}  {d:>+12.1f}")
+    print(f"  {'─'*72}")
 
-                cls_win = window_from_bounds(w_left, w_bottom, w_right, w_top,
-                                             cls_transform)
-                cls_win = cls_win.round_lengths().round_offsets()
-                r0 = max(0, int(cls_win.row_off))
-                r1 = min(cls_arr.shape[0], r0 + int(cls_win.height))
-                c0 = max(0, int(cls_win.col_off))
-                c1 = min(cls_arr.shape[1], c0 + int(cls_win.width))
+    if baseline_psd is not None:
+        print(f"\n  Patch size distribution:")
+        print(f"  {'─'*80}")
+        print(f"  {'Size class':<22}  {'Base N':>8}  {'Act N':>8}  {'ΔN':>8}  "
+              f"{'Base ha':>12}  {'Act ha':>12}  {'Δha':>12}")
+        print(f"  {'─'*80}")
+        for key, _ in _PSD_BINS:
+            bn = baseline_psd[f"psd_{key}_n"]
+            an = action_psd[f"psd_{key}_n"]
+            bh = baseline_psd[f"psd_{key}_ha"]
+            ah = action_psd[f"psd_{key}_ha"]
+            print(f"  {_PSD_LABELS[key]:<22}  {bn:>8,}  {an:>8,}  {an-bn:>+8,}  "
+                  f"  {bh:>10,.0f}  {ah:>10,.0f}  {ah-bh:>+10,.0f}")
+        print(f"  {'─'*80}")
 
-                if r1 <= r0 or c1 <= c0:
-                    continue
-
-                has_action = ((cls_arr[r0:r1, c0:c1] == 2) |
-                              (cls_arr[r0:r1, c0:c1] == 3)).any()
-
-                # Read treecover — forest extent is the shared denominator
-                tc_win    = tc_src.read(1, window=window)
-                forest    = (tc_win >= FOREST_THRESHOLD).astype(np.uint8)
-                forest_px = int(forest.sum())
-                if forest_px < 2:
-                    continue
-
-                # Reproject both rasters onto this window's 30 m grid
-                cls_repr  = np.zeros((win_h, win_w), dtype=np.uint8)
-                road_repr = np.zeros((win_h, win_w), dtype=np.uint8)
-                warp_reproject(
-                    source=cls_arr, destination=cls_repr,
-                    src_transform=cls_transform, src_crs=cls_crs,
-                    dst_transform=win_transform, dst_crs=tc_crs,
-                    resampling=WarpResampling.nearest,
-                    src_nodata=0, dst_nodata=0,
-                )
-                warp_reproject(
-                    source=road_raster, destination=road_repr,
-                    src_transform=cls_transform, src_crs=cls_crs,
-                    dst_transform=win_transform, dst_crs=tc_crs,
-                    resampling=WarpResampling.nearest,
-                    src_nodata=0, dst_nodata=0,
-                )
-
-                action_mask_win = (cls_repr == 2) | (cls_repr == 3)
-                forest_km2 = forest_px * px_area_km2
-                denom = max(forest_km2 - 1, 1e-9)
-
-                # ── All-roads baseline (current behavior) ────────────────────
-                forest_before = forest.copy()
-                forest_before[road_repr > 0] = 0
-                labeled_before, _ = ndimage_label(forest_before, structure=struct_8)
-                if labeled_before.max() > 0:
-                    sizes_before = np.bincount(labeled_before.ravel())
-                    n_before = int((sizes_before[1:] >= min_patch_px).sum())
-                else:
-                    sizes_before = np.array([0])
-                    n_before = 0
-
-                forest_after = forest_before.copy()
-                forest_after[action_mask_win] = 0
-                labeled_after, _ = ndimage_label(forest_after, structure=struct_8)
-                if labeled_after.max() > 0:
-                    sizes_after = np.bincount(labeled_after.ravel())
-                    n_after = int((sizes_after[1:] >= min_patch_px).sum())
-                else:
-                    n_after = 0
-
-                # Dissection: count before-state patches that have action roads through them
-                if has_action and labeled_before.max() > 0:
-                    labels_hit = np.unique(labeled_before[action_mask_win])
-                    labels_hit = labels_hit[labels_hit > 0]
-                    n_dissected = int(sum(1 for lid in labels_hit
-                                         if sizes_before[lid] >= min_patch_px))
-                else:
-                    n_dissected = 0
-                grid_dissection[grid_r, grid_c] = n_dissected
-                total_dissected += n_dissected
-
-                grid_index_before [grid_r, grid_c] = (n_before - 1) / denom
-                grid_index_after  [grid_r, grid_c] = (n_after  - 1) / denom
-                grid_patches_before[grid_r, grid_c] = n_before
-                grid_patches_after [grid_r, grid_c] = n_after
-                total_patches_before += n_before
-                total_patches_after  += n_after
-
-                # ── Paved-only baseline (Etoudi et al. 2023) ─────────────────
-                # Unpaved/logging roads are not effective wildlife barriers in
-                # this region, so only paved roads (road_repr == 1) are burned.
-                forest_before_pb = forest.copy()
-                forest_before_pb[road_repr == 1] = 0
-                labeled_before_pb, _ = ndimage_label(forest_before_pb, structure=struct_8)
-                if labeled_before_pb.max() > 0:
-                    sizes_before_pb = np.bincount(labeled_before_pb.ravel())
-                    n_before_pb = int((sizes_before_pb[1:] >= min_patch_px).sum())
-                else:
-                    sizes_before_pb = np.array([0])
-                    n_before_pb = 0
-
-                forest_after_pb = forest_before_pb.copy()
-                forest_after_pb[action_mask_win] = 0
-                labeled_after_pb, _ = ndimage_label(forest_after_pb, structure=struct_8)
-                if labeled_after_pb.max() > 0:
-                    sizes_after_pb = np.bincount(labeled_after_pb.ravel())
-                    n_after_pb = int((sizes_after_pb[1:] >= min_patch_px).sum())
-                else:
-                    n_after_pb = 0
-
-                # Dissection (paved-only baseline)
-                if has_action and labeled_before_pb.max() > 0:
-                    labels_hit_pb = np.unique(labeled_before_pb[action_mask_win])
-                    labels_hit_pb = labels_hit_pb[labels_hit_pb > 0]
-                    n_dissected_pb = int(sum(1 for lid in labels_hit_pb
-                                            if sizes_before_pb[lid] >= min_patch_px))
-                else:
-                    n_dissected_pb = 0
-                grid_dissection_pb[grid_r, grid_c] = n_dissected_pb
-                total_dissected_pb += n_dissected_pb
-
-                grid_index_before_pb [grid_r, grid_c] = (n_before_pb - 1) / denom
-                grid_index_after_pb  [grid_r, grid_c] = (n_after_pb  - 1) / denom
-                grid_patches_before_pb[grid_r, grid_c] = n_before_pb
-                grid_patches_after_pb [grid_r, grid_c] = n_after_pb
-                total_patches_before_pb += n_before_pb
-                total_patches_after_pb  += n_after_pb
-
-                n_windows += 1
-                if has_action:
-                    n_windows_action_roads += 1
-
-    # Country-level index: sum patches across all windows / total forest pixels
-    # (approximated as sum-of-window patches over sum-of-window forest extents)
-    # Re-read full treecover for exact country totals
-    with rasterio.open(TREECOVER_FP) as tc_src:
-        # Read in blocks to avoid loading the full raster at once
-        total_forest_px = 0
-        for _, block_win in tc_src.block_windows(1):
-            blk = tc_src.read(1, window=block_win)
-            total_forest_px += int((blk >= FOREST_THRESHOLD).sum())
-
-    total_forest_km2     = total_forest_px * px_area_km2
-    denom_country        = max(total_forest_km2 - 1, 1e-9)
-    country_index_before    = (total_patches_before    - 1) / denom_country
-    country_index_after     = (total_patches_after     - 1) / denom_country
-    country_index_before_pb = (total_patches_before_pb - 1) / denom_country
-    country_index_after_pb  = (total_patches_after_pb  - 1) / denom_country
-
-    # Save per-window grids (one pixel = one window)
-    if out_dir is not None:
-        win_label      = f"{int(window_km)}km"
-        grid_transform = Affine(
-            win_px * tc_transform.a, 0.0, tc_transform.c,
-            0.0, win_px * tc_transform.e, tc_transform.f,
-        )
-        grid_common = dict(
-            driver="GTiff", count=1, width=grid_cols, height=grid_rows,
-            crs=tc_crs, transform=grid_transform, compress="lzw",
-        )
-        grid_patches_delta = np.where(
-            (grid_patches_before >= 0) & (grid_patches_after >= 0),
-            grid_patches_after - grid_patches_before, -1,
-        ).astype(np.int32)
-        grid_index_delta = np.where(
-            np.isfinite(grid_index_before) & np.isfinite(grid_index_after),
-            grid_index_after - grid_index_before, _nan,
-        ).astype(np.float32)
-        grid_patches_delta_pb = np.where(
-            (grid_patches_before_pb >= 0) & (grid_patches_after_pb >= 0),
-            grid_patches_after_pb - grid_patches_before_pb, -1,
-        ).astype(np.int32)
-        grid_index_delta_pb = np.where(
-            np.isfinite(grid_index_before_pb) & np.isfinite(grid_index_after_pb),
-            grid_index_after_pb - grid_index_before_pb, _nan,
-        ).astype(np.float32)
-
-        files = [
-            (f"fragmentation_patches_before_{win_label}_{patch_label}_{scenario_stem}.tif",                "int32",   -1,   grid_patches_before),
-            (f"fragmentation_patches_after_{win_label}_{patch_label}_{scenario_stem}.tif",                 "int32",   -1,   grid_patches_after),
-            (f"fragmentation_patches_delta_{win_label}_{patch_label}_{scenario_stem}.tif",                 "int32",   -1,   grid_patches_delta),
-            (f"fragmentation_index_before_{win_label}_{patch_label}_{scenario_stem}.tif",                  "float32", _nan, grid_index_before),
-            (f"fragmentation_index_after_{win_label}_{patch_label}_{scenario_stem}.tif",                   "float32", _nan, grid_index_after),
-            (f"fragmentation_index_delta_{win_label}_{patch_label}_{scenario_stem}.tif",                   "float32", _nan, grid_index_delta),
-            (f"fragmentation_patches_before_paved_baseline_{win_label}_{patch_label}_{scenario_stem}.tif", "int32",   -1,   grid_patches_before_pb),
-            (f"fragmentation_patches_after_paved_baseline_{win_label}_{patch_label}_{scenario_stem}.tif",  "int32",   -1,   grid_patches_after_pb),
-            (f"fragmentation_patches_delta_paved_baseline_{win_label}_{patch_label}_{scenario_stem}.tif",  "int32",   -1,   grid_patches_delta_pb),
-            (f"fragmentation_index_before_paved_baseline_{win_label}_{patch_label}_{scenario_stem}.tif",   "float32", _nan, grid_index_before_pb),
-            (f"fragmentation_index_after_paved_baseline_{win_label}_{patch_label}_{scenario_stem}.tif",    "float32", _nan, grid_index_after_pb),
-            (f"fragmentation_index_delta_paved_baseline_{win_label}_{patch_label}_{scenario_stem}.tif",    "float32", _nan, grid_index_delta_pb),
-            (f"fragmentation_dissection_{win_label}_{patch_label}_{scenario_stem}.tif",                    "int32",   -1,   grid_dissection),
-            (f"fragmentation_dissection_paved_baseline_{win_label}_{patch_label}_{scenario_stem}.tif",     "int32",   -1,   grid_dissection_pb),
-        ]
-        for fname, dtype, nodata, arr in files:
-            fp = out_dir / fname
-            with rasterio.open(fp, "w", dtype=dtype, nodata=nodata, **grid_common) as dst:
-                dst.write(arr, 1)
-            print(f"  Saved → {fp.name}")
-
-    print(f"  Windows processed: {n_windows}  |  with action roads: {n_windows_action_roads}")
-    win_label = f"{int(window_km)}km"
-    return {
-        f"fragmentation_patches_before_{win_label}_{patch_label}":                        total_patches_before,
-        f"fragmentation_patches_after_{win_label}_{patch_label}":                         total_patches_after,
-        f"fragmentation_index_before_{win_label}_{patch_label}":                          round(country_index_before,    8),
-        f"fragmentation_index_after_{win_label}_{patch_label}":                           round(country_index_after,     8),
-        f"fragmentation_patches_before_paved_baseline_{win_label}_{patch_label}":         total_patches_before_pb,
-        f"fragmentation_patches_after_paved_baseline_{win_label}_{patch_label}":          total_patches_after_pb,
-        f"fragmentation_index_before_paved_baseline_{win_label}_{patch_label}":           round(country_index_before_pb, 8),
-        f"fragmentation_index_after_paved_baseline_{win_label}_{patch_label}":            round(country_index_after_pb,  8),
-        f"dissection_count_{win_label}_{patch_label}":                                    total_dissected,
-        f"dissection_count_paved_baseline_{win_label}_{patch_label}":                     total_dissected_pb,
-        f"fragmentation_n_windows_with_action_roads_{win_label}":                         n_windows_action_roads,
+    ret = {
+        "frag_forest_ha":              action["forest_ha"],
+        "frag_pct_forest":             action["pct_forest"],
+        "frag_n_patches":              action["n_patches"],
+        "frag_mean_patch_ha":          action["mean_patch_ha"],
+        "frag_index":                  action["frag_index"],
+        "frag_baseline_forest_ha":     baseline["forest_ha"],
+        "frag_baseline_pct_forest":    baseline["pct_forest"],
+        "frag_baseline_n_patches":     baseline["n_patches"],
+        "frag_baseline_mean_patch_ha": baseline["mean_patch_ha"],
+        "frag_baseline_frag_index":    baseline["frag_index"],
+        "frag_delta_forest_ha":        round(action["forest_ha"]     - baseline["forest_ha"],     2),
+        "frag_delta_pct_forest":       round(action["pct_forest"]    - baseline["pct_forest"],    4),
+        "frag_delta_n_patches":        action["n_patches"]           - baseline["n_patches"],
+        "frag_delta_mean_patch_ha":    round(action["mean_patch_ha"] - baseline["mean_patch_ha"], 2),
+        "frag_delta_frag_index":       round(action["frag_index"]    - baseline["frag_index"],    8),
     }
 
+    if baseline_psd is not None:
+        for key, _ in _PSD_BINS:
+            ret[f"frag_patch_size_dis_{key}_n"]          = action_psd[f"psd_{key}_n"]
+            ret[f"frag_patch_size_dis_{key}_ha"]         = action_psd[f"psd_{key}_ha"]
+            ret[f"frag_patch_size_dis_baseline_{key}_n"] = baseline_psd[f"psd_{key}_n"]
+            ret[f"frag_patch_size_dis_baseline_{key}_ha"]= baseline_psd[f"psd_{key}_ha"]
+            ret[f"frag_patch_size_dis_delta_{key}_n"]    = action_psd[f"psd_{key}_n"]  - baseline_psd[f"psd_{key}_n"]
+            ret[f"frag_patch_size_dis_delta_{key}_ha"]   = round(action_psd[f"psd_{key}_ha"] - baseline_psd[f"psd_{key}_ha"], 2)
 
-def print_forest_fragmentation(results: dict):
-    print(f"\n  Forest fragmentation (sensitivity test):")
-    print(f"  {'─'*90}")
-    print(f"  {'Window':>8}  {'Min patch':>10}  {'Patches before':>16}  {'Patches after':>15}  "
-          f"{'Index before':>13}  {'Index after':>12}  {'Dissected':>10}")
-    print(f"  {'─'*90}")
-    for w in FRAGMENTATION_WINDOW_KM:
-        for p in FRAGMENTATION_MIN_PATCH_KM2:
-            pl  = f"min{p:g}km2".replace(".", "p")
-            pb  = results.get(f"fragmentation_patches_before_{w}km_{pl}", "—")
-            pa  = results.get(f"fragmentation_patches_after_{w}km_{pl}",  "—")
-            ib  = results.get(f"fragmentation_index_before_{w}km_{pl}",   "—")
-            ia  = results.get(f"fragmentation_index_after_{w}km_{pl}",    "—")
-            dc  = results.get(f"dissection_count_{w}km_{pl}",             "—")
-            print(f"  {w:>5} km  {p:>7.0f} km²  "
-                  f"{(f'{pb:,}' if isinstance(pb, int) else pb):>16}  "
-                  f"{(f'{pa:,}' if isinstance(pa, int) else pa):>15}  "
-                  f"{(f'{ib:.6f}' if isinstance(ib, float) else ib):>13}  "
-                  f"{(f'{ia:.6f}' if isinstance(ia, float) else ia):>12}  "
-                  f"{(f'{dc:,}' if isinstance(dc, int) else dc):>10}")
-    print(f"  {'─'*90}")
-    print(f"  (non-overlapping windows, 8-connectivity, forest ≥ {FOREST_THRESHOLD}% canopy, "
-          f"index unit: patches per km²)")
+    return ret
+
 
 
 # =============================================================================
@@ -1078,8 +1002,8 @@ def run_assessment(paths_fp: Path, downsample: int = 1) -> pd.DataFrame:
     # Metric 1: road classification
     road_class, classified_raster = metric_road_classification(path_raster, road_raster, px_km)
     print_road_classification(road_class)
-    save_classified_raster(classified_raster, transform, crs,
-                           out_dir / f"classified_{paths_fp.stem}.tif")
+    classified_fp = out_dir / f"{paths_fp.stem}__classified.tif"
+    save_classified_raster(classified_raster, transform, crs, classified_fp)
 
     # Metric 2: construction cost
     cost_metrics = {}
@@ -1091,7 +1015,6 @@ def run_assessment(paths_fp: Path, downsample: int = 1) -> pd.DataFrame:
                               friction, out_dir, paths_fp.stem)
 
     # Metric 3: deforestation risk
-    classified_fp = out_dir / f"classified_{paths_fp.stem}.tif"
     defor_metrics = {}
     if RUN_DEFORESTATION:
         defor_metrics = metric_deforestation(
@@ -1105,15 +1028,15 @@ def run_assessment(paths_fp: Path, downsample: int = 1) -> pd.DataFrame:
     # Metric 4: forest fragmentation
     frag_metrics = {}
     if RUN_FRAGMENTATION:
-        for win_km in FRAGMENTATION_WINDOW_KM:
-            for min_patch in FRAGMENTATION_MIN_PATCH_KM2:
-                frag_metrics.update(metric_forest_fragmentation(
-                    classified_fp, road_raster=road_raster,
-                    window_km=win_km, min_patch_km2=min_patch,
-                    out_dir=out_dir, scenario_stem=paths_fp.stem,
-                ))
-        if frag_metrics:
-            print_forest_fragmentation(frag_metrics)
+        remaining_tif = out_dir / f"{paths_fp.stem}__defor_remaining_treecover.tif"
+        frag_metrics = metric_forest_fragmentation(
+            scenario_stem=paths_fp.stem,
+            remaining_tif=remaining_tif,
+            cls_sub=classified_raster,
+            cls_sub_transform=transform,
+            cls_crs=crs,
+            out_dir=out_dir,
+        )
 
     # ── Compile results ───────────────────────────────────────────────────────
     results = {"scenario": paths_fp.stem, **road_class, **cost_metrics}
@@ -1121,7 +1044,7 @@ def run_assessment(paths_fp: Path, downsample: int = 1) -> pd.DataFrame:
     results.update(frag_metrics)
 
     results_df = pd.DataFrame([results])
-    out_fp = out_dir / f"assessment_{paths_fp.stem}.csv"
+    out_fp = out_dir / f"{paths_fp.stem}__assessment.csv"
     results_df.to_csv(out_fp, index=False)
     print(f"\n  Saved → {out_fp}")
 
