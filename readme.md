@@ -8,13 +8,68 @@ Evaluates road network scenarios connecting mining sites to export ports in Came
 
 ![Model structure](figures/model-structure.png)
 
-**Stage 1 — Least-cost path generation** (`model/path-generator.py`)
+**Stage 1 — Least-cost path generation** (`model/path_generator.py`)
 
 Finds the optimal route from each mine to its nearest port using a cost-surface algorithm (`MCP_Geometric`). Routes follow existing roads where possible and cut new paths only when necessary. Output: GeoPackages in `model/results/least-cost-paths/`.
 
-**Stage 2 — Impact assessment** (`model/impact-assessment.py`)
+**Stage 2 — Impact assessment** (`model/impact_assessment.py`)
 
-Classifies every path pixel as paved / upgrade / new-build, then computes construction cost, deforestation risk, and forest fragmentation. Output: CSV + geospatial files in `model/results/impact-assessment/`.
+Classifies every path pixel as paved / upgrade / new-build, then computes construction cost, deforestation risk (Damania et al. 2018 distance-decay), and forest fragmentation (patch detection at admin2 level). Output: CSV + geospatial files in `model/results/impact-assessment/`.
+
+---
+
+## How to Run
+
+All commands run from `strategic-road-planning/model/`.
+
+### Step 0 — Data preparation (run once, in order)
+
+See the [Inputs](#inputs) section for the full list of preparation scripts.
+
+### Step 1 — Generate least-cost paths
+
+Edit the experiment matrix in `02_path-generator-run.py`, then:
+
+```bash
+python 02_path-generator-run.py            # run all experiments
+python 02_path-generator-run.py --dry-run  # preview without running
+```
+
+Output: `.gpkg` files in `results/least-cost-paths/<experiment_folder>/`
+
+### Step 2 — Generate baseline forest patches
+
+Required once before running impact assessment (produces the no-action fragmentation baseline).
+
+```bash
+python 03_forest-patch-detection-run__base.py
+python 03_forest-patch-detection-run__base.py --dry-run
+```
+
+Output: `data/output/forest-patch-detection/no_action__forest_patches__thresh10__minpatch1ha__adm2__roads_paved.{tif,gpkg}`
+
+### Step 3 — Run impact assessment
+
+**Option A — Batch runner** (recommended): edit `EXPERIMENTS` in `04-impact-assessment-run.py`, then:
+
+```bash
+python 04-impact-assessment-run.py
+```
+
+**Option B — Single folder via CLI:**
+
+```bash
+python impact_assessment.py experiment_00
+python impact_assessment.py experiment_00 --downsample 5   # faster, lower memory
+```
+
+Finds all `.gpkg` files in `results/least-cost-paths/experiment_00/` and writes outputs to `results/impact-assessment/experiment_00/`.
+
+**Option C — Single scenario:**
+
+```bash
+python impact_assessment.py results/least-cost-paths/experiment_00/late_stage__kribi__base__no_mask__ds1.gpkg
+```
 
 ---
 
@@ -44,6 +99,7 @@ Classifies every path pixel as paved / upgrade / new-build, then computes constr
 | ESA WorldCover 2021 (10 m) | ESA | Land cover → base cost per km |
 | Construction cost parameters | Literature (EWV model) | Cost lookup tables |
 | Hansen Global Forest Change v1.12 | Hansen et al. (2013) | Treecover 2000 + loss 2001–2024 |
+| Damania et al. (2018) decay curve | Damania et al. | Deforestation distance-decay lookup |
 | JRC Global Forest Cover 2020 v3 | JRC | Cross-check forest mask |
 | WDPA Protected Areas (Mar 2026) | UNEP-WCMC / IUCN | Spatial mask option |
 | Biodiversity Intactness Index | NHM / PREDICTS | Available; not used in current metrics |
@@ -66,9 +122,9 @@ Scenario name format: `{mining_scope}__{port}__{friction}__{mask}__ds{n}`
 
 ## Outputs
 
-Each scenario produces 21 files in `model/results/impact-assessment/`.
+All outputs are written to `model/results/impact-assessment/<experiment_folder>/`.
 
-### `assessment_{scenario}.csv`
+### `{scenario}__assessment.csv`
 
 One row per scenario.
 
@@ -76,7 +132,7 @@ One row per scenario.
 
 | Column | Unit | Description |
 |---|---|---|
-| `paved_km` | km | Along existing paved roads — no action |
+| `paved_km` | km | Along existing paved roads — no action needed |
 | `unpaved_km` | km | Existing unpaved roads to be upgraded |
 | `to_be_built_km` | km | New road construction required |
 | `total_km` | km | Total path length across all mines |
@@ -89,28 +145,32 @@ One row per scenario.
 | `new_build_cost_usd` | USD | Cost to construct new segments |
 | `total_cost_usd` | USD | `upgrade + new_build` |
 
-**Deforestation risk** — canopy-cover weighted (Hansen, ≥10% = forest); upgrade and build zones are mutually exclusive (build takes priority)
+**Deforestation risk** — Damania et al. (2018) distance-decay, "good" road quality curve, 0–10 km; canopy-weighted (Hansen ≥10% = forest); build takes priority where upgrade and build zones overlap
 
 | Column | Unit | Description |
 |---|---|---|
-| `defor_upgrade_0km_km2` | km² | Forest on direct footprint of upgrade roads |
-| `defor_build_0km_km2` | km² | Forest on direct footprint of new-build roads |
-| `defor_action_0km_km2` | km² | Combined footprint |
-| `defor_upgrade_{d}km_km2` | km² | Forest within *d* km of upgrade roads; *d* ∈ {0.1, 0.25, 0.5, 0.75, 1.0} |
-| `defor_build_{d}km_km2` | km² | Forest within *d* km of new-build roads |
-| `defor_action_{d}km_km2` | km² | Combined |
+| `defor_upgrade_ha` | ha | Expected forest cleared near upgrade roads |
+| `defor_build_ha` | ha | Expected forest cleared near new-build roads |
+| `defor_action_ha` | ha | Combined (`upgrade + build`) |
+| `total_remaining_forest_ha` | ha | Remaining forest across Cameroon after expected clearing |
 
-**Forest fragmentation** — index = (patches − 1) / (forest km² − 1); min patch 1 ha; *w* ∈ {50, 100} km
+**Forest fragmentation** — admin2-level patch detection; paved roads burned as barriers; min patch 1 ha; Hansen ≥10% threshold
 
 | Column | Unit | Description |
 |---|---|---|
-| `fragmentation_patches_before_{w}km` | count | Patch count, existing roads burned |
-| `fragmentation_patches_after_{w}km` | count | Patch count, scenario roads also burned |
-| `fragmentation_index_before_{w}km` | patches/km² | Index before |
-| `fragmentation_index_after_{w}km` | patches/km² | Index after |
-| `fragmentation_n_windows_with_action_roads_{w}km` | count | Grid cells containing action roads |
+| `frag_forest_ha` | ha | Total forest area (action scenario) |
+| `frag_pct_forest` | % | Forest cover (action) |
+| `frag_n_patches` | count | Number of patches ≥ 1 ha (action) |
+| `frag_mean_patch_ha` | ha | Patch-count-weighted mean patch size (action) |
+| `frag_index` | patches/ha | Fragmentation index (action) |
+| `frag_baseline_*` | — | Same metrics for no-action baseline |
+| `frag_delta_*` | — | Action minus baseline |
+| `frag_patch_size_dis_{bin}_n` | count | Patch count in size bin (action); bins: `lt1ha`, `1_10ha`, `10_100ha`, `100_1kha`, `1k_10kha`, `10k_100kha`, `100k_1000kha`, `gt1000kha` |
+| `frag_patch_size_dis_{bin}_ha` | ha | Total area in size bin (action) |
+| `frag_patch_size_dis_baseline_{bin}_*` | — | Same for baseline |
+| `frag_patch_size_dis_delta_{bin}_*` | — | Action minus baseline |
 
-### `action_roads_{scenario}.gpkg`
+### `{scenario}__action_roads.gpkg`
 
 Vector lines of upgrade and new-build segments.
 
@@ -120,24 +180,29 @@ Vector lines of upgrade and new-build segments.
 | `closest_port` | Destination port |
 | `action_needed` | `upgrade` or `build` |
 | `length_km` | Segment length |
-| `construction_cost_usd` | Segment-level cost (spatial inspection only; use CSV for totals) |
+| `construction_cost_usd` | Segment-level cost (for spatial inspection; use CSV for totals) |
 
-### `classified_{scenario}.tif`
+### `{scenario}__classified.tif`
 
 90 m raster: `0` = not a path pixel · `1` = paved · `2` = upgrade · `3` = new build
 
-### `defor_buffer_{d}km_{scenario}.tif`
+### `{scenario}__defor_loss_pct.tif`
 
-30 m raster (6 files, one per buffer distance): `0` = outside · `2` = upgrade buffer · `3` = build buffer
+90 m float32 raster (subregion around action roads): expected % treecover loss per pixel. NaN = water / nodata.
 
-### `fragmentation_{type}_{w}km_{scenario}.tif`
+### `{scenario}__defor_remaining_treecover.tif`
 
-12 rasters (2 window sizes × 6 types): `patches_before`, `patches_after`, `patches_delta`, `index_before`, `index_after`, `index_delta`. Nodata = −1 (int) or NaN (float) where no forest exists.
+90 m float32 raster (full Cameroon): treecover % remaining after expected clearing. NaN = water / nodata.
+
+### `{scenario}__forest_patches__thresh10__minpatch1ha__adm2__roads_paved.{tif,gpkg}`
+
+Patch-ID raster and admin2 fragmentation statistics for the action scenario.
 
 ---
 
 ## References
 
+- Damania et al. (2018). *World Bank Research Report.*
 - Hansen et al. (2013). *Science*, 342, 850–853.
 - Siqueira-Gay et al. (2022). *Nature Sustainability*, 5, 853–860.
 - Sonter et al. (2017). *Nature Communications*, 8, 1013.
