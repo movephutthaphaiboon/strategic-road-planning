@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-path-generator.py — Least-cost path engine (model only, no configuration).
+path_generator.py — Least-cost path engine (model only, no configuration).
 
 This file contains all core logic. Do not edit for experiments.
 Configure and run experiments from path-generator-run.py instead.
