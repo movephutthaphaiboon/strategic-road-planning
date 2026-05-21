@@ -112,9 +112,9 @@ python impact_assessment.py results/least-cost-paths/experiment_00/late_stage__k
 |---|---|
 | Mining scope | `late_stage`, `late_and_early_stage` |
 | Port | `kribi`, `kribi_douala` |
-| Friction | `base` |
+| Construction cost | `base`. `forest_shadow_price` |
 | Mask | `no_mask`, `protected_areas` |
-| Downsample | `ds1` (~90 m), `ds5`, `ds10` |
+<!-- | Downsample | `ds1` (~90 m), `ds5`, `ds10` | -->
 
 Scenario name format: `{mining_scope}__{port}__{friction}__{mask}__ds{n}`
 
