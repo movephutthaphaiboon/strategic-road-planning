@@ -82,8 +82,8 @@ python impact_assessment.py results/least-cost-paths/experiment_00/late_stage__k
 | 1 | `notebook/00_get-DEM.ipynb` | SRTM 90 m DEM tiles |
 | 2 | `notebook/00_get-OSM.ipynb` | Road network (OSM, HeiGIT, Liu 2025) |
 | 3 | `notebook/01_clean-roads.ipynb` | Merged road GeoPackage (`paved` / `unpaved`) |
-| 4 | `notebook/02a_model-construction-cost-friction.py` | Per-tile cost rasters (USD/pixel) |
-| 5 | `notebook/02b_merge-friction-tiles.py` | Merged friction raster (90 m, Cameroon extent) |
+| 4 | `model/01_construction-cost-friction.py` | Per-tile cost rasters (USD/pixel) |
+| 5 | `model/01_merge-friction-tiles.py` | Merged friction raster (90 m, Cameroon extent) |
 | 6 | `notebook/01a_clean-jrc-forests.py` | JRC 2020 forest mask (30 m) |
 | 7 | `notebook/01b_clean-hansen-forests.py` | `cameroon_treecover2024_30m.tif` |
 
