@@ -739,9 +739,53 @@ def print_deforestation(result: dict):
     print(f"  Formula: Σ_pixels [ canopy_frac × pct_cleared(distance) × pixel_area_ha ]")
 
 
-# def metric_mining_capacity(paths_gdf, mines_gdf) -> dict:
-#     """Estimate mining capacity unlocked by new road connectivity."""
-#     ...
+# =============================================================================
+# METRIC 0 — Mining capacity (mine accessibility)
+# =============================================================================
+
+def metric_mining_capacity(paths_gdf_all: gpd.GeoDataFrame) -> dict:
+    """
+    Count how many mines are accessible (have a viable path to a port).
+
+    Reads from the full paths GeoDataFrame before geometry filtering so that
+    skipped and unreachable mines are included in the totals.
+
+    Returns keys:
+        n_mines_total       — total mines attempted in this scenario
+        n_mines_accessible  — mines with a viable path (geometry not null)
+        n_mines_skipped     — mines explicitly skipped (in protected area / no-go zone)
+        n_mines_no_path     — mines not skipped but with no viable path found
+    """
+    n_total      = len(paths_gdf_all)
+    n_accessible = int(paths_gdf_all.geometry.notna().sum())
+
+    if "skipped" in paths_gdf_all.columns:
+        n_skipped = int(paths_gdf_all["skipped"].sum())
+        n_no_path = n_total - n_accessible - n_skipped
+    else:
+        n_skipped = None
+        n_no_path = n_total - n_accessible
+
+    result = {
+        "n_mines_total":      n_total,
+        "n_mines_accessible": n_accessible,
+        "n_mines_no_path":    n_no_path,
+    }
+    if n_skipped is not None:
+        result["n_mines_skipped"] = n_skipped
+    return result
+
+
+def print_mining_capacity(result: dict):
+    n_total = result["n_mines_total"]
+    n_acc   = result["n_mines_accessible"]
+    print(f"\n  Mining capacity:")
+    print(f"  {'─'*48}")
+    print(f"  {'Accessible mines':<25}: {n_acc:>4} / {n_total}")
+    if "n_mines_skipped" in result:
+        print(f"  {'Skipped (no-go / mask)':<25}: {result['n_mines_skipped']:>4}")
+    print(f"  {'No viable path':<25}: {result['n_mines_no_path']:>4}")
+    print(f"  {'─'*48}")
 
 
 # =============================================================================
@@ -978,9 +1022,12 @@ def run_assessment(paths_fp: Path, downsample: int = 1,
 
     # ── Load paths ────────────────────────────────────────────────────────────
     print("\n[1/4] Loading generated paths …")
-    paths_gdf = gpd.read_file(paths_fp)
-    paths_gdf = paths_gdf[paths_gdf.geometry.notna()]
-    print(f"  {len(paths_gdf)} path(s) loaded")
+    paths_gdf_all = gpd.read_file(paths_fp)
+    mine_metrics  = metric_mining_capacity(paths_gdf_all)
+    print_mining_capacity(mine_metrics)
+    paths_gdf = paths_gdf_all[paths_gdf_all.geometry.notna()].copy()
+    del paths_gdf_all
+    print(f"  {len(paths_gdf)} path(s) with geometry loaded")
 
     # ── Reference grid ────────────────────────────────────────────────────────
     print(f"\n[2/4] Building reference grid (downsample={downsample}×) …")
@@ -1045,7 +1092,7 @@ def run_assessment(paths_fp: Path, downsample: int = 1,
         )
 
     # ── Compile results ───────────────────────────────────────────────────────
-    results = {"scenario": paths_fp.stem, **road_class, **cost_metrics}
+    results = {"scenario": paths_fp.stem, **mine_metrics, **road_class, **cost_metrics}
     results.update(defor_metrics)
     results.update(frag_metrics)
 
