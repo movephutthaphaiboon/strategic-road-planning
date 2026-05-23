@@ -42,17 +42,28 @@ mining_scenario_choices = {
 
 port_choices = {
     "kribi":         {"Kribi":  (2.940594, 9.910192)},
-    "kribi_douala":  {"Kribi":  (2.940594, 9.910192),
-                      "Douala": (4.0511,   9.7679)},
+    # "kribi_douala":  {"Kribi":  (2.940594, 9.910192), "Douala": (4.0511,   9.7679)},
 }
 
+_FRICTION_DIR = DATA_DIR / "cmr-cost-friction-90m-for-experiments"
+_MASK_DIR     = DATA_DIR / "processed-protected-areas"
+
 friction_layer_choices = {
-    "base": DATA_DIR / "cmr-construction-cost-friction-90m/cmr_friction_90m_clipped.tif",
+    "construction_only":           _FRICTION_DIR / "friction__construction_only.tif",
+    "carbon_low":                  _FRICTION_DIR / "friction__carbon_low.tif",
+    "carbon_central":              _FRICTION_DIR / "friction__carbon_central.tif",
+    "carbon_high":                 _FRICTION_DIR / "friction__carbon_high.tif",
+    "carbon_low__biodiversity":    _FRICTION_DIR / "friction__carbon_low__biodiversity.tif",
+    "carbon_central__biodiversity":_FRICTION_DIR / "friction__carbon_central__biodiversity.tif",
+    "carbon_high__biodiversity":   _FRICTION_DIR / "friction__carbon_high__biodiversity.tif",
 }
 
 spatial_mask_choices = {
-    "protected_areas": DATA_DIR / "processed-protected-areas/cmr-protected-areas.gpkg",
-    "no_mask":         None,
+    "no_mask":                  None,
+    "protected_areas":          _MASK_DIR / "with-buffer/cmr-protected-areas__buffer0km.gpkg",
+    "protected_areas_buf3km":   _MASK_DIR / "with-buffer/cmr-protected-areas__buffer3km.gpkg",
+    "protected_areas_buf5km":   _MASK_DIR / "with-buffer/cmr-protected-areas__buffer5km.gpkg",
+    "protected_areas_buf10km":  _MASK_DIR / "with-buffer/cmr-protected-areas__buffer10km.gpkg",
 }
 
 # Downsampling factor applied to all experiments
