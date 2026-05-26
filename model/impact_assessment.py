@@ -70,7 +70,7 @@ FOREST_THRESHOLD           = 10     # minimum canopy cover (%) — FAO definitio
 BASELINE_FRAG_GPKG = (
     Path(__file__).parent.parent
     / "data/output/forest-patch-detection"
-    / "no_action__forest_patches__thresh10__minpatch1ha__adm2__roads_paved.gpkg"
+    / "no_action__fp__t10__mp1ha__a2__r_paved.gpkg"
 )
 
 # =============================================================================
@@ -82,6 +82,34 @@ ROADS_FP          = BASE_DIR / "data/output/processed_roads_official/cleaned_mer
 FRICTION_FP       = BASE_DIR / "data/output/cmr-construction-cost-friction-90m/cmr_friction_90m_clipped.tif"
 TREECOVER_FP      = BASE_DIR / "data/output/processed-hansen-treecover/cameroon_treecover2024_30m.tif"
 DAMANIA_LOOKUP_FP = BASE_DIR / "data/input/damania-deforestation-lookup/damania_pct_cleared.csv"
+
+# Directory containing per-experiment friction rasters (friction__{key}.tif).
+# Used to match each scenario to the friction layer that generated its path.
+FRICTION_EXPERIMENT_DIR = BASE_DIR / "data/output/cmr-cost-friction-90m-for-experiments"
+
+# Build key→path map sorted longest-first so "carbon_low__biodiversity" is
+# matched before "carbon_low" when scanning the scenario stem.
+_SCENARIO_FRICTION_MAP: dict[str, Path] = {
+    fp.stem.replace("friction__", ""): fp
+    for fp in sorted(FRICTION_EXPERIMENT_DIR.glob("friction__*.tif"),
+                     key=lambda p: -len(p.stem))
+} if FRICTION_EXPERIMENT_DIR.exists() else {}
+
+
+def _friction_fp_for_scenario(scenario_stem: str) -> Path:
+    """Return the friction file that was used to generate this scenario.
+
+    Matches the friction key embedded in the scenario name
+    (format: {scope}__{port}__{friction_key}__{mask}__ds{n}).
+    Falls back to the base construction-cost friction if no match is found.
+    """
+    for key, fp in _SCENARIO_FRICTION_MAP.items():
+        if f"__{key}__" in scenario_stem:
+            return fp
+    print(f"  Warning: no experiment friction found for '{scenario_stem}' "
+          f"— falling back to base friction")
+    return FRICTION_FP
+
 
 ROAD_TYPE_COL = "liu_surface"
 
@@ -464,44 +492,58 @@ def load_friction_values(friction_fp: Path, shape: tuple, transform,
 
 
 def metric_construction_cost(classified_raster: np.ndarray,
-                              friction: np.ndarray) -> dict:
+                              friction_scenario: np.ndarray,
+                              friction_base: np.ndarray) -> dict:
     """
     Sum friction pixel values (USD/pixel) for each road action class.
 
-    - upgrade_cost_usd   : sum over pixels where path follows unpaved road
-                           (needs surfacing / upgrading)
-    - new_build_cost_usd : sum over pixels where no road exists
-                           (needs to be built from scratch)
-    - total_cost_usd     : upgrade + new build
+    Returns a cost decomposition:
+    - upgrade_cost_usd      : scenario friction sum over upgrade pixels
+    - new_build_cost_usd    : scenario friction sum over new-build pixels
+    - total_cost_usd        : upgrade + new build (scenario friction)
+    - construction_cost_usd : base friction sum over upgrade + new-build pixels
+                              (physical construction cost, excl. shadow prices)
+    - shadow_cost_usd       : total_cost_usd − construction_cost_usd
+                              (carbon + biodiversity shadow price component)
 
     Paved pixels are excluded — road already meets standard, cost = 0.
 
     Parameters
     ----------
     classified_raster : uint8 array (0=bg, 1=paved, 2=unpaved, 3=to_be_built)
-    friction          : float32 array of construction cost in USD/pixel
+    friction_scenario : float32 array — scenario friction (USD/pixel)
+    friction_base     : float32 array — base construction-cost friction (USD/pixel)
     """
     upgrade_mask   = classified_raster == 2
     new_build_mask = classified_raster == 3
 
-    upgrade_cost   = float(np.nansum(friction[upgrade_mask]))
-    new_build_cost = float(np.nansum(friction[new_build_mask]))
+    upgrade_cost   = float(np.nansum(friction_scenario[upgrade_mask]))
+    new_build_cost = float(np.nansum(friction_scenario[new_build_mask]))
     total_cost     = upgrade_cost + new_build_cost
 
+    construction_cost = (float(np.nansum(friction_base[upgrade_mask]))
+                         + float(np.nansum(friction_base[new_build_mask])))
+    shadow_cost = total_cost - construction_cost
+
     return {
-        "upgrade_cost_usd":   round(upgrade_cost,   2),
-        "new_build_cost_usd": round(new_build_cost, 2),
-        "total_cost_usd":     round(total_cost,     2),
+        "upgrade_cost_usd":      round(upgrade_cost,      2),
+        "new_build_cost_usd":    round(new_build_cost,    2),
+        "total_cost_usd":        round(total_cost,        2),
+        "construction_cost_usd": round(construction_cost, 2),
+        "shadow_cost_usd":       round(shadow_cost,       2),
     }
 
 
 def print_construction_cost(result: dict):
     print(f"\n  Construction cost:")
-    print(f"  {'─'*48}")
-    print(f"  {'Upgrade (unpaved → paved)':<25}: ${result['upgrade_cost_usd']:>15,.0f}")
-    print(f"  {'New build':<25}: ${result['new_build_cost_usd']:>15,.0f}")
-    print(f"  {'─'*48}")
-    print(f"  {'Total':<25}: ${result['total_cost_usd']:>15,.0f}")
+    print(f"  {'─'*52}")
+    print(f"  {'Upgrade (unpaved → paved)':<28}: ${result['upgrade_cost_usd']:>15,.0f}")
+    print(f"  {'New build':<28}: ${result['new_build_cost_usd']:>15,.0f}")
+    print(f"  {'─'*52}")
+    print(f"  {'Total (scenario friction)':<28}: ${result['total_cost_usd']:>15,.0f}")
+    if "construction_cost_usd" in result:
+        print(f"  {'  of which: construction':<28}: ${result['construction_cost_usd']:>15,.0f}")
+        print(f"  {'  of which: shadow price':<28}: ${result['shadow_cost_usd']:>15,.0f}")
 
 # =============================================================================
 # METRIC 3 — Deforestation risk
@@ -1061,11 +1103,18 @@ def run_assessment(paths_fp: Path, downsample: int = 1,
     # Metric 2: construction cost
     cost_metrics = {}
     if RUN_CONSTRUCTION_COST:
-        friction = load_friction_values(FRICTION_FP, shape, transform, crs)
-        cost_metrics = metric_construction_cost(classified_raster, friction)
+        scenario_friction_fp = _friction_fp_for_scenario(paths_fp.stem)
+        print(f"  Friction layer: {scenario_friction_fp.name}")
+        friction_scenario = load_friction_values(scenario_friction_fp, shape, transform, crs)
+        if scenario_friction_fp == FRICTION_FP:
+            friction_base = friction_scenario   # base scenario — same file, no reload
+        else:
+            print(f"  Base friction:  {FRICTION_FP.name}")
+            friction_base = load_friction_values(FRICTION_FP, shape, transform, crs)
+        cost_metrics = metric_construction_cost(classified_raster, friction_scenario, friction_base)
         print_construction_cost(cost_metrics)
         save_classified_lines(paths_gdf, classified_raster, transform, crs,
-                              friction, out_dir, paths_fp.stem)
+                              friction_base, out_dir, paths_fp.stem)
 
     # Metric 3: deforestation risk
     defor_metrics = {}
