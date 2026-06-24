@@ -50,23 +50,23 @@ _FRICTION_DIR = DATA_DIR / "cmr-cost-friction-90m-for-experiments"
 _MASK_DIR     = DATA_DIR / "processed-protected-areas"
 
 friction_layer_choices = {
-    # "construction_only":           _FRICTION_DIR / "friction__construction_only.tif",
-    # "carbon_low":                  _FRICTION_DIR / "friction__carbon_low.tif",
-    # "carbon_central":              _FRICTION_DIR / "friction__carbon_central.tif",
-    # "carbon_high":                 _FRICTION_DIR / "friction__carbon_high.tif",
+    "construction_only":           _FRICTION_DIR / "friction__construction_only.tif",
+    "carbon_low":                  _FRICTION_DIR / "friction__carbon_low.tif",
+    "carbon_central":              _FRICTION_DIR / "friction__carbon_central.tif",
+    "carbon_high":                 _FRICTION_DIR / "friction__carbon_high.tif",
     # "biodiversity":                _FRICTION_DIR / "friction__biodiversity.tif",
     # "carbon_low__biodiversity":    _FRICTION_DIR / "friction__carbon_low__biodiversity.tif",
     # "carbon_central__biodiversity":_FRICTION_DIR / "friction__carbon_central__biodiversity.tif",
     # "carbon_high__biodiversity":   _FRICTION_DIR / "friction__carbon_high__biodiversity.tif",
     "carbon_300":                  _FRICTION_DIR / "friction__carbon_300.tif",
     "carbon_930":                  _FRICTION_DIR / "friction__carbon_930.tif",
-    # "carbon_1200":                 _FRICTION_DIR / "friction__carbon_1200.tif",
-    # "carbon_1400":                 _FRICTION_DIR / "friction__carbon_1400.tif",
+    "carbon_1200":                 _FRICTION_DIR / "friction__carbon_1200.tif",
+    "carbon_1400":                 _FRICTION_DIR / "friction__carbon_1400.tif",
 }
 
 spatial_mask_choices = {
-    # "no_mask":                  None,
-    # "protected_areas":          _MASK_DIR / "with-buffer/cmr-protected-areas__buffer0km.gpkg",
+    "no_mask":                  None,
+    "protected_areas":          _MASK_DIR / "with-buffer/cmr-protected-areas__buffer0km.gpkg",
     "protected_areas_buf3km":   _MASK_DIR / "with-buffer/cmr-protected-areas__buffer3km.gpkg",
     "protected_areas_buf5km":   _MASK_DIR / "with-buffer/cmr-protected-areas__buffer5km.gpkg",
     "protected_areas_buf10km":  _MASK_DIR / "with-buffer/cmr-protected-areas__buffer10km.gpkg",

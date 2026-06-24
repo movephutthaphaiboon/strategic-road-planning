@@ -11,9 +11,11 @@ Outputs (to model/results/per-mine-summary/):
     per_mine_upgrade_length_km.csv    - upgrade km per mine
     per_mine_build_length_km.csv      - new-build km per mine
     per_mine_cost_usd.csv             - construction cost USD per mine
+    per_mine_shadow_cost_usd.csv      - carbon/BII shadow price USD per mine
+    per_mine_total_cost_usd.csv       - total cost (construction + shadow) USD per mine
     per_mine_defor_direct_ha.csv      - road-footprint deforestation per mine
     per_mine_defor_total_ha.csv       - total deforestation (direct + Damania indirect) per mine
-    per_mine_fragmentation_index.csv  - frag_index of the admin-2 region containing each mine
+    per_mine_fragmentation_index.csv  - delta frag_index (scenario − no-action baseline) of the admin-2 region containing each mine
     per_mine_number_of_patches.csv    - n_patches of the admin-2 region containing each mine
 
 Deforestation methodology mirrors impact_assessment.py:
@@ -21,10 +23,19 @@ Deforestation methodology mirrors impact_assessment.py:
     classified raster grid, crops to a subregion with DAMANIA_MAX_DIST_KM padding,
     runs a distance transform, and applies the Damania pct_cleared_good curve.
 
+Shadow cost methodology mirrors impact_assessment.py metric_construction_cost():
+    shadow_cost_mine = sum((friction_scenario − friction_base)[mine_road_pixels])
+    Friction rasters are loaded once per unique key and cached in memory.
+    Shadow prices are already zeroed on existing-road pixels in the friction
+    rasters (via 01_shadow-prices-friction.py), so upgrade roads contribute ~0.
+
 Fragmentation methodology:
     Each mine is assigned to its admin-level-2 region via a one-time spatial join.
-    Per scenario the script reads the *__fp__t10__mp1ha__a2__r_paved.gpkg file and
-    looks up frag_index and n_patches for each mine's admin-2 region (adm2_pcode).
+    The no-action baseline frag_index per admin-2 is loaded once from
+    data/output/forest-patch-detection/no_action__fp__t10__mp1ha__a2__r_paved.gpkg.
+    Per scenario the script reads the *__fp__t10__mp1ha__a2__r_paved.gpkg file,
+    looks up frag_index for each mine's admin-2, and stores the delta
+    (scenario_frag_index − baseline_frag_index). n_patches is stored as-is.
 
 Run from: strategic-road-planning/
     python model/05_per-mine-outcomes.py
@@ -50,8 +61,10 @@ OUT_DIR      = BASE_DIR / "model/results/per-mine-summary"
 MINES_FP     = BASE_DIR / "data/output/cmr-mine-locations/all_mines_with_id.csv"
 DAMANIA_FP   = BASE_DIR / "data/input/damania-deforestation-lookup/damania_pct_cleared.csv"
 TREECOVER_FP = BASE_DIR / "data/output/processed-hansen-treecover/cameroon_treecover2024_30m.tif"
+FRICTION_DIR = BASE_DIR / "data/output/cmr-cost-friction-90m-for-experiments"
 
-FP_SUFFIX = "__fp__t10__mp1ha__a2__r_paved.gpkg"
+FP_SUFFIX        = "__fp__t10__mp1ha__a2__r_paved.gpkg"
+BASELINE_FP_FP   = BASE_DIR / "data/output/forest-patch-detection/no_action__fp__t10__mp1ha__a2__r_paved.gpkg"
 
 DAMANIA_MAX_DIST_KM = 10.0
 DAMANIA_CURVE       = "good"
@@ -129,6 +142,15 @@ mine_adm2_map: dict[str, str] = joined.set_index("ID")["adm2_pcode"].to_dict()
 n_unmatched = sum(1 for v in mine_adm2_map.values() if pd.isna(v))
 print(f"  Matched {len(mine_adm2_map) - n_unmatched}/{len(mine_adm2_map)} mines to admin-2 regions")
 
+# ── Step 5b: Load no-action baseline fragmentation (once) ─────────────────────
+print("Loading no-action baseline fragmentation ...")
+_base_fp_gdf = gpd.read_file(BASELINE_FP_FP, columns=["adm2_pcode", "frag_index"])
+baseline_frag_lookup: dict[str, float] = {
+    row["adm2_pcode"]: float(row["frag_index"])
+    for _, row in _base_fp_gdf.iterrows()
+}
+print(f"  Baseline frag loaded: {len(baseline_frag_lookup)} admin-2 regions")
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def px_size_m(transform, shape) -> float:
@@ -166,20 +188,46 @@ def same_grid(t1, s1, t2, s2) -> bool:
             abs(t1.c - t2.c) < 1e-9 and abs(t1.f - t2.f) < 1e-9)
 
 
+_friction_cache: dict[str, np.ndarray] = {}
+
+def load_friction(key: str, shape: tuple, transform, crs) -> np.ndarray:
+    """Load a friction raster reprojected onto the given grid, with caching."""
+    if key not in _friction_cache:
+        fp = FRICTION_DIR / f"friction__{key}.tif"
+        arr = np.full(shape, np.nan, dtype=np.float32)
+        with rasterio.open(fp) as src:
+            warp_reproject(
+                source=rasterio.band(src, 1),
+                destination=arr,
+                dst_transform=transform,
+                dst_crs=crs,
+                resampling=WarpResampling.nearest,
+            )
+        _friction_cache[key] = arr
+        print(f"  Loaded friction__{key}.tif into cache")
+    return _friction_cache[key]
+
+
+# Pre-load construction_only friction (base) once; all scenarios share the reference grid.
+print("Loading construction_only friction raster (base for shadow cost) ...")
+friction_base_arr = load_friction("construction_only", ref_shape, ref_transform, ref_crs)
+
 # ── Step 6: Main loop ─────────────────────────────────────────────────────────
 action_fps = sorted(RESULTS_DIR.glob("*__action_roads.gpkg"))
 stems      = [fp.stem.replace("__action_roads", "") for fp in action_fps]
 
 # Result containers: {mine_id: {stem: value}}
-res_action     = {m: {} for m in ROW_MINE_IDS}
-res_total_km   = {m: {} for m in ROW_MINE_IDS}
-res_upgrade_km = {m: {} for m in ROW_MINE_IDS}
-res_build_km   = {m: {} for m in ROW_MINE_IDS}
-res_cost       = {m: {} for m in ROW_MINE_IDS}
-res_direct     = {m: {} for m in ROW_MINE_IDS}
-res_total      = {m: {} for m in ROW_MINE_IDS}
-res_frag_index = {m: {} for m in ROW_MINE_IDS}
-res_n_patches  = {m: {} for m in ROW_MINE_IDS}
+res_action      = {m: {} for m in ROW_MINE_IDS}
+res_total_km    = {m: {} for m in ROW_MINE_IDS}
+res_upgrade_km  = {m: {} for m in ROW_MINE_IDS}
+res_build_km    = {m: {} for m in ROW_MINE_IDS}
+res_cost        = {m: {} for m in ROW_MINE_IDS}
+res_shadow_cost = {m: {} for m in ROW_MINE_IDS}
+res_total_cost  = {m: {} for m in ROW_MINE_IDS}
+res_direct      = {m: {} for m in ROW_MINE_IDS}
+res_total       = {m: {} for m in ROW_MINE_IDS}
+res_frag_index  = {m: {} for m in ROW_MINE_IDS}
+res_n_patches   = {m: {} for m in ROW_MINE_IDS}
 
 t0 = time.time()
 
@@ -206,6 +254,9 @@ for i, (act_fp, stem) in enumerate(zip(action_fps, stems), 1):
     cls_px_m    = px_size_m(cls_transform, cls_shape)
     cls_px_area = cls_px_m * cls_px_m / 10_000        # ha per pixel
     pad_px      = math.ceil((DAMANIA_MAX_DIST_KM * 1000 + 200) / cls_px_m)
+
+    # Friction raster for this scenario (cached; construction_only → shadow = 0)
+    friction_scenario_arr = load_friction(friction, cls_shape, cls_transform, cls_crs)
 
     # Treecover on this classified grid (usually same as reference; fallback otherwise)
     if same_grid(cls_transform, cls_shape, ref_transform, ref_shape):
@@ -259,7 +310,9 @@ for i, (act_fp, stem) in enumerate(zip(action_fps, stems), 1):
         # ── Fragmentation lookup (all mines, regardless of scope) ─────────────
         adm2 = mine_adm2_map.get(mine_id)
         if adm2 and adm2 in frag_lookup:
-            res_frag_index[mine_id][stem] = frag_lookup[adm2][0]
+            scenario_fi = frag_lookup[adm2][0]
+            baseline_fi = baseline_frag_lookup.get(adm2, float("nan"))
+            res_frag_index[mine_id][stem] = scenario_fi - baseline_fi
             res_n_patches[mine_id][stem]  = frag_lookup[adm2][1]
         else:
             res_frag_index[mine_id][stem] = float("nan")
@@ -267,13 +320,15 @@ for i, (act_fp, stem) in enumerate(zip(action_fps, stems), 1):
 
         # ── Out of scope ──────────────────────────────────────────────────────
         if mine_id not in scope_ids:
-            res_action[mine_id][stem]     = "out_of_scope"
-            res_total_km[mine_id][stem]   = float("nan")
-            res_upgrade_km[mine_id][stem] = float("nan")
-            res_build_km[mine_id][stem]   = float("nan")
-            res_cost[mine_id][stem]       = float("nan")
-            res_direct[mine_id][stem]     = float("nan")
-            res_total[mine_id][stem]      = float("nan")
+            res_action[mine_id][stem]      = "out_of_scope"
+            res_total_km[mine_id][stem]    = float("nan")
+            res_upgrade_km[mine_id][stem]  = float("nan")
+            res_build_km[mine_id][stem]    = float("nan")
+            res_cost[mine_id][stem]        = float("nan")
+            res_shadow_cost[mine_id][stem] = float("nan")
+            res_total_cost[mine_id][stem]  = float("nan")
+            res_direct[mine_id][stem]      = float("nan")
+            res_total[mine_id][stem]       = float("nan")
             continue
 
         # ── In scope but no action roads ──────────────────────────────────────
@@ -285,13 +340,15 @@ for i, (act_fp, stem) in enumerate(zip(action_fps, stems), 1):
             inaccessible = (n_no_path > 0) and (mine_id in EARLY_IDS)
             status = "inaccessible" if inaccessible else "no_action"
             nan_or_zero = float("nan") if inaccessible else 0.0
-            res_action[mine_id][stem]     = status
-            res_total_km[mine_id][stem]   = nan_or_zero
-            res_upgrade_km[mine_id][stem] = nan_or_zero
-            res_build_km[mine_id][stem]   = nan_or_zero
-            res_cost[mine_id][stem]       = nan_or_zero
-            res_direct[mine_id][stem]     = nan_or_zero
-            res_total[mine_id][stem]      = nan_or_zero
+            res_action[mine_id][stem]      = status
+            res_total_km[mine_id][stem]    = nan_or_zero
+            res_upgrade_km[mine_id][stem]  = nan_or_zero
+            res_build_km[mine_id][stem]    = nan_or_zero
+            res_cost[mine_id][stem]        = nan_or_zero
+            res_shadow_cost[mine_id][stem] = nan_or_zero
+            res_total_cost[mine_id][stem]  = nan_or_zero
+            res_direct[mine_id][stem]      = nan_or_zero
+            res_total[mine_id][stem]       = nan_or_zero
             continue
 
         # ── Mine has action roads ─────────────────────────────────────────────
@@ -303,8 +360,10 @@ for i, (act_fp, stem) in enumerate(zip(action_fps, stems), 1):
         res_cost[mine_id][stem]       = round(md["cost"],       2)
 
         if not md["geoms"]:
-            res_direct[mine_id][stem] = 0.0
-            res_total[mine_id][stem]  = 0.0
+            res_shadow_cost[mine_id][stem] = 0.0
+            res_total_cost[mine_id][stem]  = round(md["cost"], 2)
+            res_direct[mine_id][stem]      = 0.0
+            res_total[mine_id][stem]       = 0.0
             continue
 
         # Rasterize mine road segments onto classified grid
@@ -313,6 +372,15 @@ for i, (act_fp, stem) in enumerate(zip(action_fps, stems), 1):
             out_shape=cls_shape, transform=cls_transform,
             fill=0, dtype=np.uint8,
         ).astype(bool)
+
+        # Shadow cost: sum of (scenario_friction − base_friction) over mine's road pixels.
+        # Existing-road pixels have shadow = 0 in the friction rasters, so upgrade roads
+        # contribute ~0 automatically without needing a separate classified-raster read.
+        mine_shadow = float(np.nansum(
+            (friction_scenario_arr - friction_base_arr)[mine_road_px]
+        ))
+        res_shadow_cost[mine_id][stem] = round(mine_shadow, 2)
+        res_total_cost[mine_id][stem]  = round(md["cost"] + mine_shadow, 2)
 
         # Crop to tight subregion + padding
         slc = subregion_slice(mine_road_px, pad_px, cls_shape)
@@ -358,6 +426,8 @@ for csv_name, data in [
     ("per_mine_upgrade_length_km",   res_upgrade_km),
     ("per_mine_build_length_km",     res_build_km),
     ("per_mine_cost_usd",            res_cost),
+    ("per_mine_shadow_cost_usd",     res_shadow_cost),
+    ("per_mine_total_cost_usd",      res_total_cost),
     ("per_mine_defor_direct_ha",     res_direct),
     ("per_mine_defor_total_ha",      res_total),
     ("per_mine_fragmentation_index", res_frag_index),

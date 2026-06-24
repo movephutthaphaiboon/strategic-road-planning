@@ -236,11 +236,11 @@ def run_patch_detection(config: PatchConfig) -> tuple:
     if config.burn_unpaved_roads:
         road_types.append("unpaved")
 
-    roads_suffix = ("__roads_" + "_".join(road_types)) if road_types else ""
-    stem = (f"{config.prefix}__forest_patches"
-            f"__thresh{config.forest_threshold}"
-            f"__minpatch{config.min_patch_size_ha:.0f}ha"
-            f"__adm{config.admin_level}"
+    roads_suffix = ("__r_" + "_".join(road_types)) if road_types else ""
+    stem = (f"{config.prefix}__fp"
+            f"__t{config.forest_threshold}"
+            f"__mp{config.min_patch_size_ha:.0f}ha"
+            f"__a{config.admin_level}"
             f"{roads_suffix}")
     tif_out = config.output_dir / f"{stem}.tif"
     gpkg_out = config.output_dir / f"{stem}.gpkg"
