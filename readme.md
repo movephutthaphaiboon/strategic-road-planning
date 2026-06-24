@@ -6,7 +6,7 @@ Evaluates road network scenarios connecting mining sites to export ports in Came
 
 ## Model Structure
 
-![Model structure](figures/model-structure.png)
+![Model structure](figures/model_1-visual-workflow.png)
 
 **Stage 1 — Least-cost path generation** (`model/path_generator.py`)
 
@@ -42,18 +42,18 @@ Output: `.gpkg` files in `results/least-cost-paths/<experiment_folder>/`
 Required once before running impact assessment (produces the no-action fragmentation baseline).
 
 ```bash
-python 03_forest-patch-detection-run__base.py
-python 03_forest-patch-detection-run__base.py --dry-run
+python 03_no-action-forest-patch-detection-run.py
+python 03_no-action-forest-patch-detection-run.py --dry-run
 ```
 
-Output: `data/output/forest-patch-detection/no_action__forest_patches__thresh10__minpatch1ha__adm2__roads_paved.{tif,gpkg}`
+Output: `data/output/forest-patch-detection/no_action__fp__t10__mp1ha__a2__r_paved.{tif,gpkg}`
 
 ### Step 3 — Run impact assessment
 
-**Option A — Batch runner** (recommended): edit `EXPERIMENTS` in `04-impact-assessment-run.py`, then:
+**Option A — Batch runner** (recommended): edit `EXPERIMENTS` in `04_impact-assessment-run.py`, then:
 
 ```bash
-python 04-impact-assessment-run.py
+python 04_impact-assessment-run.py
 ```
 
 **Option B — Single folder via CLI:**
@@ -71,6 +71,13 @@ Finds all `.gpkg` files in `results/least-cost-paths/experiment_00/` and writes 
 python impact_assessment.py results/least-cost-paths/experiment_00/late_stage__kribi__base__no_mask__ds1.gpkg
 ```
 
+### Step 4 — Per-mine outcomes and summary (run after impact assessment)
+
+```bash
+python 05_per-mine-outcomes.py               # per-mine breakdowns (cost, deforestation, fragmentation)
+python 05_impact-assessment-result-summary.py  # aggregate all scenarios into one combined CSV
+```
+
 ---
 
 ## Inputs
@@ -79,13 +86,15 @@ python impact_assessment.py results/least-cost-paths/experiment_00/late_stage__k
 
 | Step | Script | Output |
 |---|---|---|
-| 1 | `notebook/00_get-DEM.ipynb` | SRTM 90 m DEM tiles |
-| 2 | `notebook/00_get-OSM.ipynb` | Road network (OSM, HeiGIT, Liu 2025) |
-| 3 | `notebook/01_clean-roads.ipynb` | Merged road GeoPackage (`paved` / `unpaved`) |
+| 1 | `data-preparation/00_get-DEM.ipynb` | SRTM 90 m DEM tiles |
+| 2 | `data-preparation/00_get-OSM.ipynb` | Road network (OSM, HeiGIT, Liu 2025) |
+| 3 | `data-preparation/01_clean-roads.ipynb` | Merged road GeoPackage (`paved` / `unpaved`) |
 | 4 | `model/01_construction-cost-friction.py` | Per-tile cost rasters (USD/pixel) |
 | 5 | `model/01_merge-friction-tiles.py` | Merged friction raster (90 m, Cameroon extent) |
-| 6 | `notebook/01a_clean-jrc-forests.py` | JRC 2020 forest mask (30 m) |
-| 7 | `notebook/01b_clean-hansen-forests.py` | `cameroon_treecover2024_30m.tif` |
+| 6 | `model/01_shadow-prices-friction.py` | Friction rasters with carbon + BII shadow prices |
+| 7 | `data-preparation/01a_clean-jrc-forests.py` | JRC 2020 forest mask (30 m) |
+| 8 | `data-preparation/01b_clean-hansen-forests.py` | `cameroon_treecover2024_30m.tif` |
+| 9 | `data-preparation/02_protected-areas-wtih-buffers.py` | WDPA protected area masks with buffers |
 
 ### Input datasets (`data/input/`)
 
@@ -197,6 +206,17 @@ Vector lines of upgrade and new-build segments.
 ### `{scenario}__forest_patches__thresh10__minpatch1ha__adm2__roads_paved.{tif,gpkg}`
 
 Patch-ID raster and admin2 fragmentation statistics for the action scenario.
+
+---
+
+## Result Analysis
+
+Analysis notebooks are in `result-analysis/`.
+
+| Notebook | Description |
+|---|---|
+| `analysis-final-with-guide.ipynb` | Main thesis analysis — scenario comparisons, trade-off plots, per-mine policy breakdown, sensitivity analysis across carbon prices and spatial masks |
+| `baseline-fragmentation.ipynb` | Baseline forest fragmentation diagnostics — no-action patch statistics at admin2 level |
 
 ---
 
