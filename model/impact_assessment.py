@@ -644,6 +644,11 @@ def metric_deforestation(classified_raster_fp: Path,
     print(f"  Total canopy-weighted forest area in subregion: "
           f"{float(canopy_frac.sum() * px_area_ha):,.0f} ha")
 
+    # Direct deforestation = forest physically cleared by road construction footprint
+    # (raw treecover × pixel area on road pixels, no Damania weighting)
+    action_pixels    = (cls_sub == 2) | (cls_sub == 3)
+    defor_direct_ha  = float((canopy_frac * px_area_ha * action_pixels).sum())
+
     # ── Distance transforms at 90 m (small array) ─────────────────────────────
     # Scipy distance_transform_edt allocates float64 internally — running on the
     # 90 m subregion keeps peak usage ~0.9 GB instead of 7+ GB at 30 m.
@@ -683,10 +688,13 @@ def metric_deforestation(classified_raster_fp: Path,
     cleared_build   = canopy_frac * pct_build   * px_area_ha
     cleared_action  = cleared_upgrade + cleared_build
 
+    defor_action_ha = round(float(cleared_action.sum()), 2)
     results = {
-        "defor_upgrade_ha": round(float(cleared_upgrade.sum()), 2),
-        "defor_build_ha":   round(float(cleared_build.sum()),   2),
-        "defor_action_ha":  round(float(cleared_action.sum()),  2),
+        "defor_upgrade_ha":  round(float(cleared_upgrade.sum()), 2),
+        "defor_build_ha":    round(float(cleared_build.sum()),   2),
+        "defor_action_ha":   defor_action_ha,
+        "defor_direct_ha":   round(defor_direct_ha,              2),
+        "defor_indirect_ha": round(defor_action_ha - defor_direct_ha, 2),
     }
 
     if SAVE_DEFOR_TIFS:
@@ -769,16 +777,20 @@ def metric_deforestation(classified_raster_fp: Path,
 
 
 def print_deforestation(result: dict):
-    up  = result.get("defor_upgrade_ha", 0)
-    bld = result.get("defor_build_ha",   0)
-    act = result.get("defor_action_ha",  0)
+    up  = result.get("defor_upgrade_ha",  0)
+    bld = result.get("defor_build_ha",    0)
+    act = result.get("defor_action_ha",   0)
+    dir_ = result.get("defor_direct_ha",  0)
+    ind  = result.get("defor_indirect_ha", 0)
     print(f"\n  Deforestation risk — expected forest cleared (Damania et al. 2018, {DAMANIA_CURVE} road, 0–{DAMANIA_MAX_DIST_KM:.0f} km decay):")
     print(f"  {'─'*58}")
     print(f"  {'':>12}  {'Upgrade (ha)':>14}  {'New build (ha)':>14}  {'Combined (ha)':>14}")
     print(f"  {'─'*58}")
-    print(f"  {'Expected':>12}  {up:>14,.1f}  {bld:>14,.1f}  {act:>14,.1f}")
+    print(f"  {'Total':>12}  {up:>14,.1f}  {bld:>14,.1f}  {act:>14,.1f}")
+    print(f"  {'  Direct':>12}  {'':>14}  {'':>14}  {dir_:>14,.1f}")
+    print(f"  {'  Indirect':>12}  {'':>14}  {'':>14}  {ind:>14,.1f}")
     print(f"  {'─'*58}")
-    print(f"  Formula: Σ_pixels [ canopy_frac × pct_cleared(distance) × pixel_area_ha ]")
+    print(f"  Direct = road footprint (canopy × pixel area); Indirect = Damania access effect")
 
 
 # =============================================================================
