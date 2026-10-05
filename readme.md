@@ -24,12 +24,7 @@ All commands run from `strategic-road-planning/model/`.
 
 ### Step 0 — Data preparation (run once, in order)
 
-See the [Inputs](#inputs) section for the full list of preparation scripts.
-
-### Step 0.5 — Verify inputs
-
-Run `model/00_data-inspection.ipynb` to confirm all required input files are present and correctly formatted before generating paths.
-
+See the [Inputs](#inputs) section for the full list of required data for the model. Run `00_data-inspection.ipynb` to confirm all required input files are present and correctly formatted before generating road networks.
 ### Step 1 — Generate least-cost paths
 
 Edit the experiment matrix in `02_path-generator-run.py`, then:
